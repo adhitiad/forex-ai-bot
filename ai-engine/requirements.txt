@@ -1,0 +1,24 @@
+fastapi
+uvicorn
+redis
+pandas
+pandas_ta
+numpy
+influxdb-client
+scikit-learn
+sktime
+yfinance
+# PyTorch CPU version for lighter containers
+torch --index-url https://download.pytorch.org/whl/cpu
+
+# XGBoost
+xgboost
+
+# LightGBM
+lightgbm
+
+# CatBoost
+catboost
+
+# Optuna
+optuna
