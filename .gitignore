@@ -9,6 +9,10 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+dakocan
+
+trained_model.pth
 .env
 .venv
 pip-log.txt
