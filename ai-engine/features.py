@@ -3,6 +3,7 @@ import logging
 import random
 import time
 
+import model
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
@@ -46,6 +47,17 @@ class DataFetcher:
         return df
 
     async def fetch_market_data(self, symbol=SYMBOL, period=PERIOD, interval=INTERVAL):
+        """
+        Fetches market data for the given symbol, period, and interval.
+
+        Args:
+            symbol (str): The trading symbol.
+            period (str): The period for data.
+            interval (str): The interval for data.
+
+        Returns:
+            pd.DataFrame: The market data dataframe.
+        """
         await self.smart_sleep()
         loop = asyncio.get_event_loop()
         try:
@@ -85,3 +97,28 @@ def process_features(df):
     if not all(c in df.columns for c in cols):
         return df, np.empty((0, 4))
     return df, df[cols].values
+
+
+async def train_model_async(symbol: str, timeframe: str):
+    """Asynchronous training process."""
+    try:
+        logger.info("Training started for %s with timeframe %s", symbol, timeframe)
+        # Training implementation would go here
+        # TODO: Implement model training function
+        df, features = process_features(
+            await fetcher.fetch_market_data(symbol, PERIOD, INTERVAL)
+        )
+        if df.empty:
+            logger.warning("No valid data found for training.")
+            return
+
+        labels = features[:, 0]
+        models = model.TimeSeriesTransformer(input_dim=features.shape[1])
+        models = model.train_model(
+            models, features, labels, epochs=18, batch_size=32, lr=0.001
+        )
+
+        await asyncio.sleep(1)
+        logger.info("Training completed for %s", symbol)
+    except Exception as e:
+        logger.error("Training error: %s", e)
