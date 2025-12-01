@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 pydantic
+websockets
 redis
 pandas
 pandas_ta

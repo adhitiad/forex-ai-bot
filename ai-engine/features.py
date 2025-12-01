@@ -6,7 +6,7 @@ import time
 import model
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta
 import yfinance as yf
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -32,7 +32,11 @@ class DataFetcher:
         total_sleep = wait_time + random_jitter
 
         if total_sleep > 0:
-            logger.info(f"⏳ Rate Limit: Cooling down for {total_sleep:.2f}s...")
+            logger.info(
+                "⏳ Rate Limit: Cooling down for %s and %s...",
+                total_sleep,
+                random_jitter,
+            )
             await asyncio.sleep(total_sleep)
         self.last_call_time = time.time()
 
@@ -77,8 +81,8 @@ class DataFetcher:
                 inplace=True,
             )
             return df
-        except Exception as e:
-            logger.error(f"Fetch Error: {e}")
+        except (ValueError, ConnectionError, TimeoutError) as e:
+            logger.error("Fetch Error: %s", e)
             return pd.DataFrame()
 
 
@@ -103,8 +107,6 @@ async def train_model_async(symbol: str, timeframe: str):
     """Asynchronous training process."""
     try:
         logger.info("Training started for %s with timeframe %s", symbol, timeframe)
-        # Training implementation would go here
-        # TODO: Implement model training function
         df, features = process_features(
             await fetcher.fetch_market_data(symbol, PERIOD, INTERVAL)
         )
@@ -120,5 +122,5 @@ async def train_model_async(symbol: str, timeframe: str):
 
         await asyncio.sleep(1)
         logger.info("Training completed for %s", symbol)
-    except Exception as e:
+    except (ValueError, RuntimeError, asyncio.TimeoutError) as e:
         logger.error("Training error: %s", e)

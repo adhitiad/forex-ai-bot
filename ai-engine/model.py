@@ -81,6 +81,8 @@ def train_model(model, features, labels, epochs=15, batch_size=32, lr=0.001):
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        logger.info(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(dataloader):.4f}")
+        logger.info(
+            "Epoch %d/%d, Loss: %.4f", epoch + 1, epochs, total_loss / len(dataloader)
+        )
 
     return model

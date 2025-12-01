@@ -1,14 +1,17 @@
+"""
+AI Engine - Main Application
+"""
+
 import asyncio
 import json
 import logging
 import os
-import time
-from typing import Optional
+from typing import List, Optional
 
 import config
 import redis
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from features import fetcher, process_features, train_model_async
 from influxdb_client.client.influxdb_client import InfluxDBClient
 from influxdb_client.client.write.point import Point
@@ -29,20 +32,36 @@ app = FastAPI(
 
 # Pydantic Models
 class PredictionRequest(BaseModel):
+    """
+    Request model for making predictions.
+    """
+
     symbol: Optional[str] = None  # Optional, defaults to config
 
 
 class BacktestRequest(BaseModel):
+    """
+    Request model for backtesting.
+    """
+
     symbol: Optional[str] = None
     days: int = 60
 
 
 class TrainRequest(BaseModel):
+    """
+    Request model for training.
+    """
+
     symbol: Optional[str] = None
     timeframe: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
+    """
+    Response model for health checks.
+    """
+
     status: str
     timestamp: str
     model_loaded: bool
@@ -75,6 +94,79 @@ SYMBOL = config.SYMBOL_YF
 SYMBOL_BINANCE = "BTCUSDT"
 
 
+# WebSocket Manager for Real-Time Mode
+class WebSocketManager:
+    """
+    Class to manage WebSocket connections.
+    """
+
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        """Connect a WebSocket client."""
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info(
+            "WebSocket client connected. Total clients: %s",
+            len(self.active_connections),
+        )
+
+    def disconnect(self, websocket: WebSocket):
+        """Disconnect a WebSocket client."""
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+            logger.info(
+                "WebSocket client disconnected. Total clients: %s",
+                len(self.active_connections),
+            )
+
+    async def broadcast(self, message: dict):
+        """Broadcast message to all connected clients."""
+        if not self.active_connections:
+            return
+
+        disconnected = []
+        for websocket in self.active_connections:
+            try:
+                await websocket.send_json(message)
+            except (WebSocketDisconnect, OSError, ConnectionError) as e:
+                logger.error("Error sending to WebSocket client: %s", e)
+                disconnected.append(websocket)
+
+        # Clean up disconnected clients
+        for ws in disconnected:
+            self.disconnect(ws)
+
+
+# Global WebSocket Manager
+ws_manager = WebSocketManager()
+
+
+class RealtimeState:
+    """
+    Class to manage the real-time mode state.
+    """
+
+    def __init__(self):
+        self.active = False
+
+
+realtime_state = RealtimeState()
+
+
+class TradingState:
+    """
+    Class to manage the trading state.
+    """
+
+    def __init__(self):
+        self.active = False
+
+
+trading_state = TradingState()
+
+
 @app.get("/trade/start")
 async def trading_loop():
     """
@@ -99,7 +191,7 @@ async def trading_loop():
                 continue
 
             # 2. Process
-            full_df, features = process_features(raw_df)
+            _, features = process_features(raw_df)
             if len(features) < 30:
                 continue
 
@@ -117,6 +209,30 @@ async def trading_loop():
                 action = "SELL"
 
             price = float(raw_df.iloc[-1]["close"])
+
+            # Broadcast real-time data to WebSocket clients
+            if realtime_state.active:
+                realtime_data = {
+                    "type": "market_data",
+                    "symbol": SYMBOL,
+                    "price": price,
+                    "timestamp": str(raw_df.index[-1]),
+                    "prediction": {
+                        "action": action,
+                        "probabilities": {
+                            "buy": float(probs[0]),
+                            "sell": float(probs[1]),
+                            "hold": float(probs[2]),
+                        },
+                        "confidence": float(max(probs)),
+                    },
+                    "features": {
+                        "rsi": float(features[-1][1]) if len(features) > 0 else None,
+                        "ema": float(features[-1][2]) if len(features) > 0 else None,
+                        "atr": float(features[-1][3]) if len(features) > 0 else None,
+                    },
+                }
+                await ws_manager.broadcast(realtime_data)
 
             # Logic Kirim Sinyal ke Go
             if action != "HOLD":
@@ -138,6 +254,15 @@ async def trading_loop():
                     "lot": config.LOT_SIZE,
                 }
                 r.publish("trade_signals", json.dumps(signal))
+
+                # Broadcast signal to WebSocket clients
+                if realtime_state.active:
+                    signal_broadcast = {
+                        "type": "trade_signal",
+                        "signal": signal,
+                        "timestamp": str(asyncio.get_event_loop().time()),
+                    }
+                    await ws_manager.broadcast(signal_broadcast)
 
             # 5. Save & Publish
             p = (
@@ -164,16 +289,29 @@ async def trading_loop():
             await asyncio.sleep(5)
 
 
-# Global variable to track trading status
-trading_active = False
-
-
 @app.on_event("startup")
 async def startup():
     """Start the trading loop."""
-    global trading_active
-    trading_active = True
+    trading_state.active = True
     asyncio.create_task(trading_loop())
+
+
+# WebSocket Endpoints
+@app.websocket("/ws/realtime")
+async def websocket_realtime(websocket: WebSocket):
+    """WebSocket endpoint for real-time AI engine data."""
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive, clients can send messages if needed
+            data = await websocket.receive_text()
+            # For now, just echo or handle simple commands
+            if data == "ping":
+                await websocket.send_json(
+                    {"type": "pong", "timestamp": str(asyncio.get_event_loop().time())}
+                )
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
 
 
 # API Routes
@@ -187,7 +325,7 @@ async def health_check():
         status="healthy",
         timestamp=str(asyncio.get_event_loop().time()),
         model_loaded=model_loaded,
-        trading_active=trading_active,
+        trading_active=trading_state.active,
     )
 
 
@@ -216,7 +354,9 @@ async def get_status():
     return {
         "symbol": SYMBOL,
         "model_loaded": model_loaded,
-        "trading_active": trading_active,
+        "trading_active": trading_state.active,
+        "realtime_mode_active": realtime_state.active,
+        "websocket_clients": len(ws_manager.active_connections),
         "config": {
             "timeframe": config.TIMEFRAME,
             "take_profit_pct": config.TAKE_PROFIT_PCT,
@@ -228,61 +368,12 @@ async def get_status():
     }
 
 
-@app.post("/predict")
-async def get_prediction(request: PredictionRequest):
-    """Get AI prediction for current market data."""
-    try:
-        symbol = request.symbol or SYMBOL
-
-        # Fetch latest data
-        raw_df = await fetcher.fetch_market_data(
-            symbol=symbol, period="60d", interval=config.TIMEFRAME
-        )
-
-        if raw_df.empty:
-            raise HTTPException(
-                status_code=404, detail=f"No data found for symbol {symbol}"
-            )
-
-        # Process features
-        full_df, features = process_features(raw_df)
-        if len(features) < config.SEQ_LEN:
-            raise HTTPException(
-                status_code=400, detail="Insufficient data for prediction"
-            )
-
-        # Make prediction
-        tensor_in = torch.FloatTensor(features[-config.SEQ_LEN :]).unsqueeze(0)
-        with torch.no_grad():
-            probs = model(tensor_in).numpy()[0]  # [Buy, Sell, Hold]
-
-        current_price = float(raw_df.iloc[-1]["close"])
-
-        # Determine action
-        action = "HOLD"
-        confidence = float(max(probs))
-        if probs[0] > config.CONFIDENCE_THRESHOLD:
-            action = "BUY"
-        elif probs[1] > config.CONFIDENCE_THRESHOLD:
-            action = "SELL"
-
-        return {
-            "symbol": symbol,
-            "current_price": current_price,
-            "prediction": {
-                "action": action,
-                "confidence": confidence,
-                "probabilities": {
-                    "buy": float(probs[0]),
-                    "sell": float(probs[1]),
-                    "hold": float(probs[2]),
-                },
-            },
-            "timestamp": str(raw_df.index[-1]),
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+@app.post("/realtime/enable")
+async def enable_realtime_mode():
+    """Enable real-time mode for WebSocket broadcasting."""
+    realtime_state.active = True
+    logger.info("🔄 Real-time mode enabled")
+    return {"message": "Real-time mode enabled"}
 
 
 @app.post("/backtest")
@@ -334,7 +425,7 @@ async def test_signal():
     """Test signal generation (development endpoint)."""
     try:
         # Generate a test signal
-        test_signal = {
+        signal = {
             "symbol": SYMBOL_BINANCE,
             "action": "BUY",
             "price": 50000.0,
@@ -344,9 +435,9 @@ async def test_signal():
         }
 
         # Publish to Redis
-        r.publish("trade_signals", json.dumps(test_signal))
+        r.publish("trade_signals", json.dumps(signal))
 
-        return {"message": "Test signal sent", "signal": test_signal}
+        return {"message": "Test signal sent", "signal": signal}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
