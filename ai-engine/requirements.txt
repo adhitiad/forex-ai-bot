@@ -1,26 +1,17 @@
 fastapi
 uvicorn
-pydantic
-websockets
 redis
+sqlalchemy
+psycopg2-binary
 pandas
 pandas_ta
 numpy
-influxdb-client
 scikit-learn
-sktime
+pydantic
+pydantic-settings
+python-dotenv
+joblib
 yfinance
-# PyTorch CPU version for lighter containers
+websockets
+tenacity
 torch --index-url https://download.pytorch.org/whl/cpu
-
-# XGBoost
-xgboost
-
-# LightGBM
-lightgbm
-
-# CatBoost
-catboost
-
-# Optuna
-optuna

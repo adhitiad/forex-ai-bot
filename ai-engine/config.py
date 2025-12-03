@@ -1,31 +1,41 @@
-# ai-engine/config.py
+from dotenv import load_dotenv
+from pydantic_settings import BaseSettings
 
-# --- ASSET CONFIG ---
-# Gunakan 'XAUUSD=X' untuk Gold Spot di Yahoo Finance
-SYMBOL_YF = "GBPUSD=X"
-SYMBOL_BINANCE = (
-    "XAUUSDT"  # Simbol untuk eksekusi (jika crypto gold PAXG) atau Forex Broker API
-)
+load_dotenv()
 
-# --- MODEL CONFIG ---
-SEQ_LEN = 30  # Melihat 30 candle ke belakang
-PREDICT_WINDOW = 4  # Memprediksi tren 4 candle ke depan
-TIMEFRAME = "1h"  # Timeframe H1
-TRAIN_PERIOD = "2y"  # Data latih 2 tahun
-MODEL_FILE = "trained_model.pth"
 
-# --- TRADING PARAMS (BACKTEST & LIVE) ---
-INITIAL_BALANCE = 10000  # Saldo Awal USD
-LOT_SIZE = 0.01  # Ukuran Lot
-LEVERAGE = 100  # Asumsi Leverage (Standard Forex/Gold)
-CONTRACT_SIZE = 100  # 1 Lot Gold = 100 Oz (Standard)
+class Settings(BaseSettings):
+    # Trading
+    SYMBOL_YF: str = "EURUSD=X"
+    SYMBOL_BINANCE: str = "XAUUSD"
+    TIMEFRAME: str = "1h"
+    SEQ_LEN: int = 30
+    PREDICT_WINDOW: int = 4
 
-# --- RISK MANAGEMENT ---
-# Target Profit & Stop Loss dalam Persentase Harga Entry
-# Contoh: Entry 2000. TP 30% = Target 2600.
-TAKE_PROFIT_PCT = 0.30  # 30%
-STOP_LOSS_PCT = 0.25  # 25%
-CONFIDENCE_THRESHOLD = 0.60  # Minimal yakin 60% baru entry
+    # Risk Management
+    LOT_SIZE: float = 0.01
+    TAKE_PROFIT_PCT: float = 0.005  # 0.5%
+    STOP_LOSS_PCT: float = 0.005  # 0.5%
+    CONTRACT_SIZE: int = 100
 
-# --- INFLUXDB CONFIG ---
-INFLUX_BUCKET = "forex_ai_bot"
+    # Redis
+    REDIS_HOST: str
+    REDIS_PORT: int
+    REDIS_PASSWORD: str
+
+    # Database
+    DATABASE_URL: str
+
+    # Paths
+    MODEL_FILE: str = "trained_model.pth"
+    SCALER_FILE: str = "scaler.pkl"
+
+    class Config:
+        """
+        Pydantic settings configuration.
+        """
+
+        env_file = ".env"
+
+
+settings = Settings()  # type: ignore
