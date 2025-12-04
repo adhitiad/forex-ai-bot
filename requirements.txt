@@ -1,17 +1,16 @@
 fastapi
 uvicorn
-redis
 sqlalchemy
-psycopg2-binary
-pandas
-pandas_ta
-numpy
-scikit-learn
-pydantic
 pydantic-settings
 python-dotenv
-joblib
+redis
+pandas
+numpy
+pandas-ta
 yfinance
-websockets
+ccxt
+scikit-learn
+groq
+feedparser
 tenacity
 torch --index-url https://download.pytorch.org/whl/cpu

@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class PositionalEncoding(nn.Module):
@@ -17,7 +18,7 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x):
-        x = x + self.pe[: x.size(1), :]
+        x = x + self.get_buffer("pe")[: x.size(1), :]
         return x
 
 
@@ -37,4 +38,4 @@ class TimeSeriesTransformer(nn.Module):
     def forward(self, x):
         x = self.pos_encoder(self.embedding(x))
         x = self.transformer(x)
-        return self.decoder(x[:, -1, :])
+        return F.softmax(self.decoder(x[:, -1, :]), dim=1)
