@@ -10,11 +10,11 @@ from config import settings
 from stream_manager import streamor
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("GNewsSentiment")
+logger = logging.getLogger("GNewsSentiment....")
 
 client_nvdia = ChatNVIDIA(
     model="deepseek-ai/deepseek-r1",
-    api_key="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",
+    api_key=settings.NVIDIA_API_KEY,  # Ambil dari config
     temperature=0.6,
     top_p=0.7,
     max_completion_tokens=5135,

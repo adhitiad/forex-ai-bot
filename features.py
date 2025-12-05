@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import time
+from math import e
 
 import ccxt
 import joblib
@@ -105,36 +106,91 @@ class FeatureEngineer:
     def __init__(self, path=settings.SCALER_FILE):
         self.path = path
         self.scaler = RobustScaler()
+        # Fitur yang digunakan (Pastikan urutannya KONSISTEN selamanya)
         self.cols = ["returns", "RSI_14", "EMA_20", "ATRr_14"]
 
     def load_scaler(self):
+        """Memuat scaler dari disk agar normalisasi data live sama dengan data training"""
         if os.path.exists(self.path):
-            self.scaler = joblib.load(self.path)
-            return True
+            try:
+                self.scaler = joblib.load(self.path)
+                return True
+            except Exception as e:
+                logging.error(f"Error loading scaler: {e}")
+                return False
         return False
 
     def process(self, df, is_training=False):
+        """
+        Mengubah OHLCV menjadi Technical Indicators
+        is_training=True -> Menghitung statistik scaling baru dan SIMPAN ke file.
+        is_training=False -> Menggunakan statistik scaling yang sudah disimpan.
+        """
         if df.empty:
             return df, np.empty((0, 4))
+
         df = df.copy()
+
+        # 1. Technical Indicators Calculation
         df["returns"] = df["close"].pct_change()
+        # Gunakan fillna untuk menghindari NaN di awal jika memungkinkan,
+        # tapi dropna lebih aman untuk akurasi model
         df.ta.rsi(length=14, append=True)
         df.ta.ema(length=20, append=True)
         df.ta.atr(length=14, append=True)
+
+        # Hapus baris NaN akibat perhitungan indikator (20 baris pertama)
         df.dropna(inplace=True)
-        if not all(c in df.columns for c in self.cols):
+
+        if df.empty:
             return df, np.empty((0, 4))
+
+        # Pastikan kolom tersedia
+        if not all(c in df.columns for c in self.cols):
+            logging.error(f"Missing columns. Found: {df.columns}")
+            return df, np.empty((0, 4))
+
         raw = df[self.cols].values
+
+        # 2. Scaling (RobustScaler untuk menangani outlier crypto/forex)
         if is_training:
+            # Mode Training: Pelajari data dan simpan "kamus" scaling
             scaled = self.scaler.fit_transform(raw)
+            # Pastikan direktori ada
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
             joblib.dump(self.scaler, self.path)
+            logging.info(f"Scaler saved to {self.path}")
         else:
+            # Mode Live/Brain: Gunakan "kamus" lama
+            # Jangan fit ulang! Nanti bot bingung nilai 0.5 itu berapa.
             try:
+                # Cek atribut scaler untuk memastikan sudah di-fit
+                if not hasattr(self.scaler, "center_"):
+                    if not self.load_scaler():
+                        logging.error("Scaler not fitted and file not found!")
+                        return df, np.empty((0, 4))
                 scaled = self.scaler.transform(raw)
-            except:
+            except Exception as e:
+                logging.error(f"Scaling error: {e}")
                 return df, np.empty((0, 4))
+
         return df, scaled
 
+    def save_to_dataset(self, df, folder):
+        """Simpan DataFrame ke dalam format dataset (CSV) di folder tertentu."""
+        if df.empty:
+            logging.warning("DataFrame is empty. Skipping save.")
+            return
+        elif not df.columns:
+            logging.warning("DataFrame has no columns. Skipping save.")
+            return
 
-fetcher = DataFetcher()
+        os.makedirs(folder, exist_ok=True)
+        file_path = os.path.join(folder, f"{settings.ACTIVE_SYMBOL}_dataset.csv")
+        df.to_csv(file_path, index=False)
+        logging.info(f"Dataset saved to {file_path}")
+
+
+# Instance global
+fetcher = DataFetcher()  # Pastikan class DataFetcher didefinisikan/diimport
 processor = FeatureEngineer()

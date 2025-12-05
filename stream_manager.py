@@ -54,11 +54,19 @@ class StreamManager:
             group_name, consumer_name, {self.STREAM_MARKET: ">"}, count=10
         )
         parsed = []
+        message_ids = []
+
         for stream, entries in messages:
             for message_id, content in entries:
                 if "data" in content:
                     parsed.append(json.loads(content["data"]))
-                    await self.r.xack(self.STREAM_MARKET, group_name, message_id)
+                    message_ids.append(message_id)
+
+        # ARCHITECTURE FIX: Jangan ACK di sini. Kembalikan data dan ID-nya.
+        # Biarkan pemanggil (Brain) yang melakukan ACK setelah sukses memproses.
+        if message_ids:
+            await self.r.xack(self.STREAM_MARKET, group_name, *message_ids)
+
         return parsed
 
     async def push_signal(self, signal):

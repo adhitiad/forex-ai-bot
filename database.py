@@ -1,41 +1,59 @@
-from datetime import datetime
+import datetime
+import logging
 
-import pytz
+# Definisi Tabel
 from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from config import settings
 
-engine = create_engine(settings.DATABASE_URL, connect_args={"check_same_thread": False})
+# Setup Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("Database")
+
+# --- FIX DATABASE CRASH ---
+connect_args = {}
+
+# Cek apakah pakai SQLite?
+if "sqlite" in settings.DATABASE_URL:
+    # Hanya SQLite yang butuh ini
+    connect_args = {"check_same_thread": False}
+    logger.info("📂 Using SQLite Database")
+else:
+    # PostgreSQL tidak boleh ada check_same_thread
+    logger.info("🐘 Using PostgreSQL/Remote Database")
+
+# Buat Engine dengan argumen yang sudah disesuaikan
+engine = create_engine(
+    settings.DATABASE_URL,
+    connect_args=connect_args,
+    # pool_pre_ping berguna agar koneksi Postgres tidak putus saat idle lama
+    pool_pre_ping=True,
+)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
 class TradeLog(Base):
     __tablename__ = "trade_logs"
+
     id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime, default=lambda: datetime.now(pytz.utc))
-    symbol = Column(String)
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+    symbol = Column(String, index=True)
     action = Column(String)
     entry_price = Column(Float)
     tp_price = Column(Float)
     sl_price = Column(Float)
-    exit_time = Column(DateTime, nullable=True)
-    exit_price = Column(Float, nullable=True)
-    status = Column(String)
-    pnl = Column(Float, nullable=True)
-
-
-class ModelLog(Base):
-    __tablename__ = "model_logs"
-    id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime, default=lambda: datetime.now(pytz.utc))
-    version = Column(String)
     status = Column(String)
 
 
 def init_db():
-    Base.metadata.create_all(bind=engine)
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.info("✅ Database Tables Ready")
+    except Exception as e:
+        logger.error(f"❌ Database Init Failed: {e}")
 
 
 def get_db():
