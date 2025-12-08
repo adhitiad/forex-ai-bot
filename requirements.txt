@@ -5,6 +5,7 @@ pydantic-settings
 python-dotenv
 redis
 pandas
+pandas-stubs
 numpy
 pandas-ta
 yfinance

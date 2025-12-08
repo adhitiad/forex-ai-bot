@@ -1,70 +1,94 @@
 import asyncio
 import datetime
 import logging
-
+import ccxt.async_support as ccxt
 from config import settings
-from features import fetcher
 from stream_manager import streamor
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("Ingestor-Forex")
+logger = logging.getLogger("Ingestor")
 
 
 class IngestorEngine:
     def __init__(self):
         self.running = True
         self.symbol = settings.ACTIVE_SYMBOL
+        self.exchange = None
 
-    async def is_market_open(self):
-        """Cek apakah pasar Forex buka (Senin-Jumat)"""
-        now = datetime.datetime.now()
-        # 0=Senin, 4=Jumat, 5=Sabtu, 6=Minggu
-        if now.weekday() >= 5:
-            return False
-        return True
+    async def init_exchange(self):
+        try:
+            exchange_class = getattr(ccxt, settings.EXCHANGE_ID)
+            self.exchange = exchange_class(
+                {
+                    "apiKey": settings.TOKOCRYPTO_API_KEY,
+                    "secret": settings.TOKOCRYPTO_SECRET,
+                    "enableRateLimit": True,
+                    "timeout": 30000,  # 30 seconds timeout
+                    "options": {
+                        "defaultType": "spot",
+                        "adjustForTimeDifference": True,
+                    },
+                }
+            )
+            # Don't call load_markets() - it can cause timeout issues
+            # Markets will be loaded on-demand when needed
+            logger.info(f"✅ Connected to {settings.EXCHANGE_ID.upper()}")
+        except Exception as e:
+            logger.error(f"❌ Init Error: {e}")
+            # Don't stop running - try to continue with fetch_ticker
+            # self.running = False
 
-    async def data_producer(self):
-        logger.info(f"🌍 Forex Engine Started. Target: {self.symbol}")
+    async def run(self):
+        await self.init_exchange()
 
-        # Setup fetcher ke mode Forex
-        fetcher.update_config("FOREX", self.symbol)
+        # Ensure exchange was successfully initialized
+        if self.exchange is None:
+            logger.error("❌ Exchange not initialized. Exiting...")
+            return
+
+        logger.info(f"🚀 Tracking: {self.symbol}")
+
+        retry_count = 0
+        max_retries = 3
 
         while self.running:
             try:
-                # 1. Cek Libur Pasar
-                if not await self.is_market_open():
-                    logger.info("💤 Market Closed (Weekend). Sleeping for 10 hours...")
-                    await asyncio.sleep(36000)  # Tidur sabtu dan minggu
-                    continue
+                ticker = await self.exchange.fetch_ticker(self.symbol)
+                payload = {
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "open": float(
+                        ticker["open"] if ticker.get("open") else ticker["last"]
+                    ),
+                    "high": float(
+                        ticker["high"] if ticker.get("high") else ticker["last"]
+                    ),
+                    "low": float(
+                        ticker["low"] if ticker.get("low") else ticker["last"]
+                    ),
+                    "close": float(ticker["last"]),
+                    "volume": float(ticker["baseVolume"]),
+                    "source": settings.EXCHANGE_ID.upper(),
+                }
+                await streamor.push_market_data(self.symbol, payload)
+                logger.info(f"🪙 {self.symbol}: {payload['close']}")
 
-                # 2. Ambil Data
-                df = await fetcher.fetch_market_data(period="1d", limit=100)
-
-                if df is not None and not df.empty:
-                    last = df.iloc[-1]
-                    payload = {
-                        "timestamp": str(df.index[-1]),
-                        "open": float(last["open"]),
-                        "high": float(last["high"]),
-                        "low": float(last["low"]),
-                        "close": float(last["close"]),
-                        "volume": float(last["volume"]),
-                        "source": "FOREX",
-                    }
-
-                    await streamor.push_market_data(self.symbol, payload)
-                    logger.info(f"💱 Tick {self.symbol}: {payload['close']}")
-
-                # Forex tidak secepat Crypto, polling tiap 60 detik cukup
-                await asyncio.sleep(60)
+                # Reset retry counter on success
+                retry_count = 0
+                await asyncio.sleep(2)
 
             except Exception as e:
-                logger.error(f"Error fetching Forex data: {e}")
-                await asyncio.sleep(10)
+                retry_count += 1
+                wait_time = min(retry_count * 5, 30)  # Max 30 seconds
+                logger.error(f"❌ Fetch Error (attempt {retry_count}): {e}")
 
-    async def run(self):
-        # Kita hapus command_listener karena ini mode Khusus Forex (Hardcoded)
-        await self.data_producer()
+                if retry_count >= max_retries:
+                    logger.warning(f"⚠️ Max retries reached, resetting counter...")
+                    retry_count = 0
+
+                await asyncio.sleep(wait_time)
+
+        if self.exchange:
+            await self.exchange.close()
 
 
 if __name__ == "__main__":

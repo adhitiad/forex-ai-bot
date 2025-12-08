@@ -1,57 +1,72 @@
 import asyncio
 import logging
-
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.utils.class_weight import compute_class_weight
+import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.utils.class_weight import compute_class_weight
 
 from config import settings
-from features import fetcher, processor
+from features import fetcher, processor, DataFetcher, FeatureEngineer
+from yfinance_fetcher import yfinance_fetcher
 from model import TimeSeriesTransformer
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ForexTrainer")
+logger = logging.getLogger("Trainer")
 
 
 async def train():
-    logger.info(f"🚀 Training Forex Model for {settings.ACTIVE_SYMBOL}...")
+    symbol = (
+        settings.YFINANCE_SYMBOL if settings.USE_YFINANCE else settings.ACTIVE_SYMBOL
+    )
+    logger.info(f"🚀 Training Model for {symbol}...")
+    logger.info(
+        f"📊 Data Source: {'Yahoo Finance' if settings.USE_YFINANCE else 'CCXT Exchange'}"
+    )
 
-    # 1. Fetch Data Forex Jangka Panjang (2 Tahun)
-    fetcher.update_config("FOREX", settings.ACTIVE_SYMBOL)
-    raw = await fetcher.fetch_market_data(period="2y", limit=None)  # Limit None = Max
+    # 1. Download Data (Setahun terakhir)
+    if settings.USE_YFINANCE:
+        # Gunakan Yahoo Finance (tidak diblokir)
+        df = await yfinance_fetcher.fetch_market_data(
+            symbol=settings.YFINANCE_SYMBOL, days=365, interval="1h"
+        )
+    else:
+        # Gunakan CCXT Exchange
+        df = await fetcher.fetch_market_data(days=365)
 
-    if raw.empty:
-        logger.error("❌ Failed to fetch Forex data via Yahoo Finance.")
+    if df.empty:
+        logger.error("❌ No data fetched. Check internet connection or symbol.")
         return
 
-    # Download data simpan ke dataset pada folder "data"
-    processor.save_to_dataset(df, "data")
-
-    logger.info(f"📊 Downloaded {len(raw)} candles.")
-
     # 2. Process & Scale
-    df, scaled = processor.process(raw, is_training=True)
+    df, scaled = processor.process(df, is_training=True)
 
-    # 3. Labeling Khusus Forex
+    if len(scaled) < 100:
+        logger.error("❌ Not enough data points for training.")
+        return
+
+    # 3. Labeling (Menentukan Target Buy/Sell)
     X, y = [], []
-    prediction_window = 4
+    prediction_window = 4  # Prediksi 4 candle ke depan
+
+    # Threshold Profit (Sesuaikan dengan volatilitas Crypto)
+    # Jika harga naik > 1.5% dalam 4 jam -> BUY
+    THRESHOLD = 0.015
 
     for i in range(len(scaled) - settings.SEQ_LEN - prediction_window):
+        # Input: Sequence candle terakhir
         X.append(scaled[i : i + settings.SEQ_LEN])
 
+        # Target Calculation
         current_close = df.iloc[i + settings.SEQ_LEN]["close"]
         future_close = df.iloc[i + settings.SEQ_LEN + prediction_window]["close"]
 
         diff = (future_close - current_close) / current_close
 
-        # Threshold Forex lebih kecil daripada Crypto
-        # 0.001 = 0.1% (sekitar 10 pips). Jika gerak > 10 pips, anggap tren.
-        if diff > 0.001:
+        if diff > THRESHOLD:
             y.append(1)  # BUY
-        elif diff < -0.001:
+        elif diff < -THRESHOLD:
             y.append(2)  # SELL
         else:
             y.append(0)  # HOLD
@@ -59,52 +74,52 @@ async def train():
     X = np.array(X)
     y = np.array(y)
 
-    # 4. Class Balancing (Agar AI tidak bias ke "HOLD")
-    classes = np.unique(y)
-    weights = compute_class_weight(class_weight="balanced", classes=classes, y=y)
-    class_weights = torch.FloatTensor(weights)
-    logger.info(f"⚖️ Class Weights: {weights} (Hold, Buy, Sell)")
+    logger.info(f"📊 Dataset size: {len(X)} samples")
+    unique, counts = np.unique(y, return_counts=True)
+    logger.info(f"⚖️ Class Distribution: {dict(zip(unique, counts))}")
 
-    # Convert to Tensor
+    # 4. Convert to PyTorch Tensor
+    # Class Weighting agar model tidak bias ke HOLD (0)
+    class_weights = compute_class_weight("balanced", classes=np.unique(y), y=y)
+    weights_tensor = torch.FloatTensor(class_weights)
+
     dataset = TensorDataset(torch.FloatTensor(X), torch.LongTensor(y))
-    # Batch size diperbesar agar training lebih stabil
-    loader = DataLoader(dataset, batch_size=64, shuffle=True)
+    loader = DataLoader(dataset, batch_size=32, shuffle=True)
 
     # 5. Model Setup
     model = TimeSeriesTransformer(input_dim=4, output_dim=3)
-    opt = optim.Adam(model.parameters(), lr=0.0001)  # Learning rate diperkecil
-    # Masukkan weight ke loss function
-    crit = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss(weight=weights_tensor)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     model.train()
-    logger.info(f"🔥 Start Training on {len(X)} sequences")
+    epochs = 20
 
-    # Epoch Loop
-    epochs = 20  # Tingkatkan epoch
-    for e in range(epochs):
+    logger.info("🔥 Starting Training Loop...")
+
+    for epoch in range(epochs):
         total_loss = 0
         correct = 0
         total = 0
 
-        for bx, by in loader:
-            opt.zero_grad()
-            outputs = model(bx)  # Output: Logits
-            loss = crit(outputs, by)
+        for batch_X, batch_y in loader:
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
             loss.backward()
-            opt.step()
+            optimizer.step()
 
             total_loss += loss.item()
             _, predicted = torch.max(outputs.data, 1)
-            total += by.size(0)
-            correct += (predicted == by).sum().item()
+            total += batch_y.size(0)
+            correct += (predicted == batch_y).sum().item()
 
-        avg_loss = total_loss / len(loader)
-        acc = 100 * correct / total
-        print(f"Epoch {e+1}/{epochs} | Loss: {avg_loss:.4f} | Acc: {acc:.2f}%")
+        logger.info(
+            f"Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(loader):.4f} | Acc: {100*correct/total:.2f}%"
+        )
 
     # 6. Save Model
     torch.save(model.state_dict(), settings.MODEL_FILE)
-    logger.info("✅ Model Saved Successfully")
+    logger.info(f"✅ Model saved to {settings.MODEL_FILE}")
 
 
 if __name__ == "__main__":
