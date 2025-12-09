@@ -1,15 +1,15 @@
 import asyncio
 import logging
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-from torch.utils.data import DataLoader, TensorDataset
 from sklearn.utils.class_weight import compute_class_weight
+from torch.utils.data import DataLoader, TensorDataset
 
 from config import settings
-from features import fetcher, processor, DataFetcher, FeatureEngineer
-from yfinance_fetcher import yfinance_fetcher
+from features import fetcher, processor
 from model import TimeSeriesTransformer
 
 logging.basicConfig(level=logging.INFO)
@@ -17,52 +17,22 @@ logger = logging.getLogger("Trainer")
 
 
 async def train():
-    symbol = (
-        settings.YFINANCE_SYMBOL if settings.USE_YFINANCE else settings.ACTIVE_SYMBOL
-    )
-    logger.info(f"🚀 Training Model for {symbol}...")
-    logger.info(
-        f"📊 Data Source: {'Yahoo Finance' if settings.USE_YFINANCE else 'CCXT Exchange'}"
-    )
-
-    # 1. Download Data (Setahun terakhir)
-    if settings.USE_YFINANCE:
-        # Gunakan Yahoo Finance (tidak diblokir)
-        df = await yfinance_fetcher.fetch_market_data(
-            symbol=settings.YFINANCE_SYMBOL, days=365, interval="1h"
-        )
-    else:
-        # Gunakan CCXT Exchange
-        df = await fetcher.fetch_market_data(days=365)
+    logger.info(f"🚀 Training for {settings.YFINANCE_SYMBOL}...")
+    df = await fetcher.fetch_market_data(days=730)  # 2 Tahun data
 
     if df.empty:
-        logger.error("❌ No data fetched. Check internet connection or symbol.")
         return
-
-    # 2. Process & Scale
     df, scaled = processor.process(df, is_training=True)
 
-    if len(scaled) < 100:
-        logger.error("❌ Not enough data points for training.")
-        return
-
-    # 3. Labeling (Menentukan Target Buy/Sell)
     X, y = [], []
-    prediction_window = 4  # Prediksi 4 candle ke depan
-
-    # Threshold Profit (Sesuaikan dengan volatilitas Crypto)
-    # Jika harga naik > 1.5% dalam 4 jam -> BUY
-    THRESHOLD = 0.015
+    prediction_window = 4
+    THRESHOLD = 0.0015  # 0.15% (Sekitar 15-20 Pips EURUSD)
 
     for i in range(len(scaled) - settings.SEQ_LEN - prediction_window):
-        # Input: Sequence candle terakhir
         X.append(scaled[i : i + settings.SEQ_LEN])
-
-        # Target Calculation
-        current_close = df.iloc[i + settings.SEQ_LEN]["close"]
-        future_close = df.iloc[i + settings.SEQ_LEN + prediction_window]["close"]
-
-        diff = (future_close - current_close) / current_close
+        curr = df.iloc[i + settings.SEQ_LEN]["close"]
+        fut = df.iloc[i + settings.SEQ_LEN + prediction_window]["close"]
+        diff = (fut - curr) / curr
 
         if diff > THRESHOLD:
             y.append(1)  # BUY
@@ -71,55 +41,37 @@ async def train():
         else:
             y.append(0)  # HOLD
 
-    X = np.array(X)
-    y = np.array(y)
+    X, y = np.array(X), np.array(y)
 
-    logger.info(f"📊 Dataset size: {len(X)} samples")
-    unique, counts = np.unique(y, return_counts=True)
-    logger.info(f"⚖️ Class Distribution: {dict(zip(unique, counts))}")
-
-    # 4. Convert to PyTorch Tensor
-    # Class Weighting agar model tidak bias ke HOLD (0)
     class_weights = compute_class_weight("balanced", classes=np.unique(y), y=y)
-    weights_tensor = torch.FloatTensor(class_weights)
+    full_weights = np.ones(3)
+    for cls, w in zip(np.unique(y), class_weights):
+        full_weights[cls] = w
 
     dataset = TensorDataset(torch.FloatTensor(X), torch.LongTensor(y))
     loader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-    # 5. Model Setup
     model = TimeSeriesTransformer(input_dim=4, output_dim=3)
-    criterion = nn.CrossEntropyLoss(weight=weights_tensor)
+    criterion = nn.CrossEntropyLoss(weight=torch.FloatTensor(full_weights))
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     model.train()
-    epochs = 20
-
-    logger.info("🔥 Starting Training Loop...")
-
-    for epoch in range(epochs):
+    for epoch in range(20):
         total_loss = 0
-        correct = 0
-        total = 0
-
         for batch_X, batch_y in loader:
             optimizer.zero_grad()
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
+            out = model(batch_X)
+            loss = criterion(out, batch_y)
             loss.backward()
             optimizer.step()
-
             total_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
-            total += batch_y.size(0)
-            correct += (predicted == batch_y).sum().item()
-
+            accuracy = (out.argmax(dim=1) == batch_y).float().mean().item()
         logger.info(
-            f"Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(loader):.4f} | Acc: {100*correct/total:.2f}%"
+            f"Epoch {epoch+1}/20 | Loss: {total_loss/len(loader):.4f} | Accuracy: {accuracy*100:.2f}%"
         )
 
-    # 6. Save Model
     torch.save(model.state_dict(), settings.MODEL_FILE)
-    logger.info(f"✅ Model saved to {settings.MODEL_FILE}")
+    logger.info(f"✅ Saved to {settings.MODEL_FILE}")
 
 
 if __name__ == "__main__":

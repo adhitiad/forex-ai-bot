@@ -9,9 +9,9 @@ pandas-stubs
 numpy
 pandas-ta
 yfinance
-ccxt
 scikit-learn
 groq
 feedparser
 tenacity
 torch --index-url https://download.pytorch.org/whl/cpu
+oandapyV20 

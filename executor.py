@@ -1,149 +1,98 @@
 import asyncio
+import datetime
 import json
 import logging
-import datetime
-from typing import Optional
-import ccxt.async_support as ccxt
+
 import redis.asyncio as redis
+
 from config import settings
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("Executor")
+logger = logging.getLogger("PaperTrade")
 
 
-class TradeExecutor:
+class PaperExecutor:
     def __init__(self):
-        self.r: Optional[redis.Redis] = None
-        self.exchange: Optional[ccxt.Exchange] = None
+        self.r = None
 
-    async def init_services(self):
+    async def init_redis(self):
         self.r = redis.Redis(
             host=settings.REDIS_HOST,
             port=settings.REDIS_PORT,
             password=settings.REDIS_PASSWORD,
             decode_responses=True,
         )
-        if not settings.TOKOCRYPTO_API_KEY:
-            logger.warning("⚠️ PAPER MODE (No API Key)")
-        else:
-            try:
-                self.exchange = ccxt.tokocrypto(
-                    {
-                        "apiKey": settings.TOKOCRYPTO_API_KEY,
-                        "secret": settings.TOKOCRYPTO_SECRET,
-                        "enableRateLimit": True,
-                        "options": {"defaultType": "spot"},
-                    }
-                )
-                await self.exchange.load_markets()
-                logger.info("✅ Exchange Connected")
-            except Exception as e:
-                logger.error(f"❌ Exchange Error: {e}")
-
-    async def check_min_notional(self, symbol, amount, price):
-        if not self.exchange:
-            return True
-        try:
-            market = self.exchange.market(symbol)
-            cost = amount * price
-            min_cost = market["limits"]["cost"]["min"] if market.get("limits") else 10.0
-            if cost < min_cost:
-                logger.warning(f"⛔ Rejected: Cost {cost} < Min {min_cost}")
-                return False
-            return True
-        except:
-            return True
 
     async def execute_trade(self, signal):
         action = signal.get("action")
-        symbol = signal.get("symbol")
-        price = float(signal.get("entry_price", 0))
+        try:
+            entry_price = float(signal.get("entry_price", 0))
+        except:
+            return
 
-        status = "FAILED"
-        filled_price = price
-        filled_amount = 0
-        order_id = "SIM-" + str(int(datetime.datetime.now().timestamp()))
+        # 1. Tentukan Nilai Pip (Pip Value)
+        # JPY pairs (e.g. USDJPY) 1 pip = 0.01, Lainnya (EURUSD) = 0.0001
+        is_jpy = "JPY" in settings.ACTIVE_SYMBOL or "jpy" in settings.ACTIVE_SYMBOL
+        pip_unit = 0.01 if is_jpy else 0.0001
 
-        if not self.exchange:
-            logger.info(f"📝 [PAPER] {action} {symbol}")
-            status = "SUCCESS"
-        else:
-            try:
-                market = self.exchange.market(symbol)
-                amount = 0
-                order = None
+        # 2. Hitung Jarak TP dan SL
+        tp_dist = settings.TAKE_PROFIT_PIPS * pip_unit
+        sl_dist = settings.STOP_LOSS_PIPS * pip_unit
 
-                if action == "BUY":
-                    bal = await self.exchange.fetch_balance()
-                    quote = market["quote"]
-                    free = float(bal[quote]["free"] or 0.0)
-                    target = free * 0.98
-                    amount = float(
-                        self.exchange.amount_to_precision(symbol, target / price)
-                    )
+        # 3. Hitung Harga TP dan SL
+        if action == "BUY":
+            tp_price = entry_price + tp_dist
+            sl_price = entry_price - sl_dist
+            color = "🟢"  # Hijau untuk Buy
+        else:  # SELL
+            tp_price = entry_price - tp_dist
+            sl_price = entry_price + sl_dist
+            color = "🔴"  # Merah untuk Sell
 
-                    if await self.check_min_notional(symbol, amount, price):
-                        logger.info("🚀 BUYING %s %s", amount, symbol)
-                        order = await self.exchange.create_market_buy_order(
-                            symbol, amount
-                        )
+        # 4. TAMPILKAN DATA LENGKAP (Display)
+        print("\n" + "=" * 50)
+        print(f"{color} SIGNAL RECEIVED: {action} {settings.ACTIVE_SYMBOL}")
+        print(f"   💵 Entry Price : {entry_price:.5f}")
+        print(f"   🎯 Take Profit : {tp_price:.5f} (+{settings.TAKE_PROFIT_PIPS} pips)")
+        print(f"   🛡️ Stop Loss   : {sl_price:.5f} (-{settings.STOP_LOSS_PIPS} pips)")
+        print(f"   📦 Units       : {settings.TRADE_UNITS}")
+        print("=" * 50 + "\n")
 
-                elif action == "SELL":
-                    bal = await self.exchange.fetch_balance()
-                    base = market["base"]
-                    free = float(bal[base]["free"] or 0.0)
-                    amount = float(self.exchange.amount_to_precision(symbol, free))
+        # 5. Kirim Konfirmasi ke Brain (Simulasi Order Filled)
+        order_id = f"SIM-{int(datetime.datetime.now().timestamp())}"
+        confirm = {
+            "event": "ORDER_CONFIRMED",
+            "original_action": action,
+            "symbol": settings.ACTIVE_SYMBOL,
+            "filled_price": entry_price,
+            "filled_amount": settings.TRADE_UNITS,
+            "order_id": order_id,
+            "status": "FILLED_SIMULATED",
+        }
 
-                    if await self.check_min_notional(symbol, amount, price):
-                        logger.info("🚀 SELLING %s %s", amount, symbol)
-                        order = await self.exchange.create_market_sell_order(
-                            symbol, amount
-                        )
-
-                if order:
-                    status = "SUCCESS"
-                    order_id = order["id"]
-                    filled_amount = order.get("filled", amount)
-                    filled_price = order.get("average", price)
-                    logger.info(f"✅ Filled: {order_id}")
-
-            except Exception as e:
-                logger.error(f"❌ Exec Error: {e}")
-
-        if status == "SUCCESS":
-            confirm = {
-                "event": "ORDER_CONFIRMED",
-                "original_action": action,
-                "symbol": symbol,
-                "filled_price": float(filled_price) if filled_price else price,
-                "filled_amount": float(filled_amount),
-                "order_id": str(order_id),
-            }
-            if self.r:
-                await self.r.publish(settings.CHANNEL_CONFIRMATION, json.dumps(confirm))
-                logger.info("📢 Confirmation Sent")
+        if self.r:
+            await self.r.publish(settings.CHANNEL_CONFIRMATION, json.dumps(confirm))
+            logger.info(f"✅ Order {order_id} Confirmed to System")
 
     async def run(self):
-        await self.init_services()
+        await self.init_redis()
         if not self.r:
-            logger.error("❌ Redis not initialized")
+            logger.error("❌ Redis connection failed")
             return
+
         pubsub = self.r.pubsub()
         await pubsub.subscribe(settings.CHANNEL_SIGNALS)
-        logger.info("🎧 Waiting for Signals...")
+        logger.info("🎧 Paper Executor Ready & Waiting for Signals...")
+
         async for msg in pubsub.listen():
             if msg["type"] == "message":
                 try:
                     data = json.loads(msg["data"])
-                    if data.get("action") in ["BUY", "SELL", "CLOSE_BUY", "CLOSE_SELL"]:
-                        act = data["action"]
-                        if "CLOSE" in act:
-                            act = "SELL" if "BUY" in act else "BUY"
-                        data["action"] = act
+                    if data.get("action") in ["BUY", "SELL"]:
                         await self.execute_trade(data)
                 except Exception as e:
-                    logger.error(e)
+                    logger.error(f"Error processing signal: {e}")
 
 
 if __name__ == "__main__":
-    asyncio.run(TradeExecutor().run())
+    asyncio.run(PaperExecutor().run())

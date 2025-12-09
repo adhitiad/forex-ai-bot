@@ -3,9 +3,10 @@ import datetime
 import json
 import logging
 from collections import deque
+from typing import Optional
+
 import redis.asyncio as redis
 import torch
-from typing import Optional
 
 from config import settings
 from database import TradeLog, get_db
@@ -71,8 +72,8 @@ class Brain:
         self.pending_start_time = None
 
         if action == "BUY":
-            tp = price * (1 + settings.TAKE_PROFIT_PCT)
-            sl = price * (1 - settings.STOP_LOSS_PCT)
+            tp = price * (1 + settings.TAKE_PROFIT_PIPS)
+            sl = price * (1 - settings.STOP_LOSS_PIPS)
 
             # Save DB & State
             trade = TradeLog(
@@ -143,12 +144,27 @@ class Brain:
                 }
             )
 
+    def is_market_open(self):
+        # 5=Sabtu, 6=Minggu -> Tutup
+        return datetime.datetime.now().weekday() < 5
+
     async def run(self):
         await self.init()
         logger.info("🧠 Brain Running...")
 
         while True:
             # --- TIMEOUT GUARD (Anti Deadlock) ---
+
+            if not self.is_market_open():
+                logger.info("💤 Weekend - Market Closed. Sleeping...")
+                await asyncio.sleep(300)
+                continue
+
+            candles = await streamor.consume_market_data()
+            if not candles:
+                await asyncio.sleep(0.1)
+                continue
+
             if self.is_pending_order and self.pending_start_time:
                 if (
                     datetime.datetime.now() - self.pending_start_time
@@ -190,4 +206,5 @@ class Brain:
 
 
 if __name__ == "__main__":
+    asyncio.run(Brain().run())
     asyncio.run(Brain().run())
