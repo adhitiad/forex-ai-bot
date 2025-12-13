@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package market;
+
+// Definisi Service
+service MarketDataService {
+  // Fungsi untuk mengirim satu tick data
+  rpc SubmitTick (TickRequest) returns (TickResponse);
+  
+  // Fungsi untuk mengirim banyak data sekaligus (Streaming) - Level Expert
+  rpc StreamTicks (stream TickRequest) returns (TickResponse);
+}
+
+// Struktur Data Input
+message TickRequest {
+  string symbol = 1;
+  double price = 2;
+  double volume = 3;
+  string timestamp = 4;
+}
+
+// Struktur Data Output
+message TickResponse {
+  bool success = 1;
+  string message = 2;
+}

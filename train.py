@@ -1,13 +1,17 @@
 import asyncio
+import json
 import logging
 
 import numpy as np
+import redis.asyncio as redis
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader, TensorDataset
 
+# Import Cloud Manager (Pastikan file cloud_manager.py sudah dibuat)
+from cloud_manager import cloud_manager
 from config import settings
 from features import fetcher, processor
 from model import TimeSeriesTransformer
@@ -21,7 +25,9 @@ async def train():
     df = await fetcher.fetch_market_data(days=730)  # 2 Tahun data
 
     if df.empty:
+        logger.error("❌ Data kosong. Training dibatalkan.")
         return
+
     df, scaled = processor.process(df, is_training=True)
 
     X, y = [], []
@@ -43,6 +49,11 @@ async def train():
 
     X, y = np.array(X), np.array(y)
 
+    if len(np.unique(y)) < 3:
+        logger.warning(
+            "⚠️ Data tidak seimbang (kurang kelas). Melanjutkan apa adanya..."
+        )
+
     class_weights = compute_class_weight("balanced", classes=np.unique(y), y=y)
     full_weights = np.ones(3)
     for cls, w in zip(np.unique(y), class_weights):
@@ -58,6 +69,7 @@ async def train():
     model.train()
     for epoch in range(20):
         total_loss = 0
+        accuracy = 0
         for batch_X, batch_y in loader:
             optimizer.zero_grad()
             out = model(batch_X)
@@ -66,12 +78,37 @@ async def train():
             optimizer.step()
             total_loss += loss.item()
             accuracy = (out.argmax(dim=1) == batch_y).float().mean().item()
+
         logger.info(
             f"Epoch {epoch+1}/20 | Loss: {total_loss/len(loader):.4f} | Accuracy: {accuracy*100:.2f}%"
         )
 
+    # 1. SIMPAN MODEL KE LOKAL
     torch.save(model.state_dict(), settings.MODEL_FILE)
-    logger.info(f"✅ Saved to {settings.MODEL_FILE}")
+    logger.info(f"✅ Saved locally to {settings.MODEL_FILE}")
+
+    # 2. UPLOAD KE CLOUDINARY (BACKUP)
+    # Kita jalankan di thread terpisah agar tidak blocking
+    await asyncio.to_thread(cloud_manager.upload_model)
+
+    # 3. NOTIFIKASI KE SYSTEM (REDIS)
+    # Memberitahu Brain bahwa training selesai & model baru siap
+    try:
+        r = redis.Redis(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            password=settings.REDIS_PASSWORD,
+            decode_responses=True,
+        )
+
+        message = {"event": "TRAINING_COMPLETED", "status": "SUCCESS"}
+
+        await r.publish(settings.CHANNEL_SYSTEM, json.dumps(message))
+        logger.info("📢 Report sent: Training Completed. System notified.")
+        await r.close()
+
+    except Exception as e:
+        logger.error(f"❌ Failed to publish training status: {e}")
 
 
 if __name__ == "__main__":

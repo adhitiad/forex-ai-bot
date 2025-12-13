@@ -1,58 +1,84 @@
 import asyncio
-import datetime
+import json
 import logging
 
+import grpc
 import yfinance as yf
 
 from config import settings
-from stream_manager import streamor
+from database import UserPreference, get_db
+
+# Import gRPC stubs
+from protos import market_pb2, market_pb2_grpc
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("YFinanceIngestor")
+logger = logging.getLogger("Ingestor-GRPC")
 
 
-class YFinanceIngestor:
+class GrpcIngestor:
     def __init__(self):
-        self.symbol = settings.ACTIVE_SYMBOL
-        self.interval = settings.TIMEFRAME
+        self.active_symbols = set()
+        # Buka koneksi gRPC ke Data Service
+        self.channel = grpc.aio.insecure_channel(settings.GRPC_SERVER_HOST)
+        self.stub = market_pb2_grpc.MarketDataServiceStub(self.channel)
 
-    async def fetch_candle(self):
+    def refresh_symbol_list(self):
+        db = next(get_db())
+        results = (
+            db.query(UserPreference.active_symbol)
+            .filter(UserPreference.is_active == True)
+            .distinct()
+            .all()
+        )
+        self.active_symbols = {r[0] for r in results}
+        if not self.active_symbols:
+            self.active_symbols = {settings.YFINANCE_SYMBOL}
+
+    async def fetch_and_push(self):
+        if not self.active_symbols:
+            return
+        tickers = " ".join(self.active_symbols)
+
         try:
-            # Ambil data intraday terbaru (period=1y cukup untuk intraday)
-            ticker = yf.Ticker(self.symbol)
-            df = ticker.history(period="1y", interval=self.interval)
+            data = yf.download(
+                tickers, period="1d", interval="1m", group_by="ticker", progress=False
+            )
 
-            if not df.empty:
-                # Ambil candle terakhir
+            for symbol in self.active_symbols:
+                df = data if len(self.active_symbols) == 1 else data.get(symbol)
+                if df is None or df.empty:
+                    continue
+
                 latest = df.iloc[-1]
 
-                # Format payload sesuai standar bot
-                payload = {
-                    "timestamp": str(latest.name),
-                    "open": float(latest["Open"]),
-                    "high": float(latest["High"]),
-                    "low": float(latest["Low"]),
-                    "close": float(latest["Close"]),
-                    "volume": float(latest["Volume"]),
-                    "source": "YFINANCE",
-                }
+                # --- KIRIM VIA GRPC (Microservice Call) ---
+                # Ini jauh lebih efisien & terstruktur daripada JSON string di Redis
+                request = market_pb2.TickRequest(
+                    symbol=symbol,
+                    price=float(latest["Close"]),
+                    volume=float(latest["Volume"]),
+                    timestamp=str(latest.name),
+                )
 
-                await streamor.push_market_data(self.symbol, payload)
-                logger.info(f"📈 {self.symbol} | Close: {payload['close']:.5f}")
-            else:
-                logger.warning("⚠️ Data kosong dari Yahoo Finance (Market Tutup?)")
+                # Call Remote Procedure
+                response = await self.stub.SubmitTick(request)
+
+                if not response.success:
+                    logger.error(f"gRPC Failed for {symbol}: {response.message}")
+
+            logger.info(
+                f"✅ Sent {len(self.active_symbols)} ticks to TimescaleDB via gRPC"
+            )
 
         except Exception as e:
-            logger.error(f"❌ YFinance Error: {e}")
+            logger.error(f"Ingest Error: {e}")
 
     async def run(self):
-        logger.info(f"🚀 YFinance Ingestor Started: {self.symbol} [{self.interval}]")
-        streamor.connect()
         while True:
-            await self.fetch_candle()
-            # Polling setiap 60 detik (Yahoo Finance delay 1-2 menit, jangan spam)
+            self.refresh_symbol_list()
+            await self.fetch_and_push()
             await asyncio.sleep(60)
 
 
 if __name__ == "__main__":
-    asyncio.run(YFinanceIngestor().run())
+    asyncio.run(GrpcIngestor().run())

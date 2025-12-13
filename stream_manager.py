@@ -1,7 +1,9 @@
 import asyncio
 import json
 import logging
+
 import redis.asyncio as redis
+
 from config import settings
 
 logging.basicConfig(level=logging.INFO)
@@ -14,12 +16,14 @@ class StreamManager:
 
     def connect(self):
         try:
-            self.r = redis.Redis(
-                host=settings.REDIS_HOST,
-                port=settings.REDIS_PORT,
-                password=settings.REDIS_PASSWORD,
-                decode_responses=True,
-            )
+            kwargs = {
+                "host": settings.REDIS_HOST,
+                "port": settings.REDIS_PORT,
+                "decode_responses": True,
+            }
+            if settings.REDIS_PASSWORD:
+                kwargs["password"] = settings.REDIS_PASSWORD
+            self.r = redis.Redis(**kwargs)
             logger.info("✅ Redis Connected")
         except Exception as e:
             logger.error(f"❌ Redis Error: {e}")

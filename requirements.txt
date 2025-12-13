@@ -5,13 +5,24 @@ pydantic-settings
 python-dotenv
 redis
 pandas
-pandas-stubs
-numpy
 pandas-ta
+numpy
 yfinance
 scikit-learn
 groq
 feedparser
 tenacity
 torch --index-url https://download.pytorch.org/whl/cpu
-oandapyV20 
+oandapyV20
+langchain
+langchain-groq
+langchain-community
+langchain-core
+pinecone
+cloudinary
+requests
+sentence-transformers
+aiohttp
+psycopg2-binary   # Driver PostgreSQL/TimescaleDB
+grpcio            # gRPC Core
+grpcio-tools      # Tools untuk generate code gRPC

@@ -2,94 +2,118 @@ import asyncio
 import datetime
 import json
 import logging
+import os
+import subprocess
+import sys
 from collections import deque
-from typing import Optional
+from typing import cast
 
+import numpy as np
+import pandas as pd  # Wajib ada untuk proses data
 import redis.asyncio as redis
 import torch
 
+from cloud_manager import cloud_manager
 from config import settings
 from database import TradeLog, get_db
+from features import processor  # Import processor untuk scaling data
 from model import TimeSeriesTransformer
 from state_manager import state_manager
 from stream_manager import streamor
 
+# brain.py
+
+
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("Brain-V2")
+logger = logging.getLogger("Brain-V1")
 
 
 class Brain:
     def __init__(self):
-        self.buffer = deque(maxlen=300)
+        # Buffer dilebihkan sedikit dari SEQ_LEN agar indikator teknikal (RSI/EMA) bisa terhitung
+        self.buffer = deque(maxlen=settings.SEQ_LEN + 50)
         self.model = None
+        self.r_brain = None
+
+        # State Self-Healing
+        self.consecutive_losses = 0
+        self.is_training_mode = False
+
+        # State Trading
         self.is_pending_order = False
         self.pending_start_time = None
-        self.db_gen = get_db()
-        self.db = next(self.db_gen)
-        self.r_brain: Optional[redis.Redis] = None
 
     async def init(self):
-        # Load Model (Safe Fail)
+        await self.load_model()
+        kwargs = {
+            "host": settings.REDIS_HOST,
+            "port": settings.REDIS_PORT,
+            "decode_responses": True,
+        }
+        if settings.REDIS_PASSWORD:
+            kwargs["password"] = settings.REDIS_PASSWORD
+        self.r_brain = cast(redis.Redis, redis.Redis(**kwargs))
+        asyncio.create_task(self.listen_events())
+
+    async def load_model(self):
         self.model = TimeSeriesTransformer(input_dim=4)
+        if not os.path.exists(settings.MODEL_FILE):
+            await asyncio.to_thread(cloud_manager.download_model)
+
         try:
             self.model.load_state_dict(torch.load(settings.MODEL_FILE))
-            self.model.eval()
+            self.model.eval()  # Set mode evaluasi (bukan training)
+            logger.info("🧠 AI Model Loaded Successfully.")
         except:
-            logger.warning("⚠️ Model not found, running logic only")
+            logger.warning("⚠️ Model not found or corrupt. Running Logic Only.")
 
-        self.r_brain = redis.Redis(
-            host=settings.REDIS_HOST,
-            port=settings.REDIS_PORT,
-            password=settings.REDIS_PASSWORD,
-            decode_responses=True,
-        )
-        asyncio.create_task(self.listen_confirmations())
-
-    async def listen_confirmations(self):
-        if self.r_brain is None:
-            logger.error("❌ Redis connection not initialized!")
-            return
-
+    async def listen_events(self):
+        assert self.r_brain is not None
         pubsub = self.r_brain.pubsub()
-        await pubsub.subscribe(settings.CHANNEL_CONFIRMATION)
-        logger.info("👂 Listening Confirmations...")
+        await pubsub.subscribe(settings.CHANNEL_CONFIRMATION, settings.CHANNEL_SYSTEM)
 
         async for msg in pubsub.listen():
             if msg["type"] == "message":
                 try:
                     data = json.loads(msg["data"])
-                    await self.handle_confirmation(data)
+                    channel = msg["channel"]
+
+                    if (
+                        channel == settings.CHANNEL_SYSTEM
+                        and data.get("event") == "TRAINING_COMPLETED"
+                    ):
+                        logger.info("🎓 Training Done. Reloading Brain...")
+                        await self.load_model()
+                        self.consecutive_losses = 0
+                        self.is_training_mode = False
+
+                    elif channel == settings.CHANNEL_CONFIRMATION:
+                        self.is_pending_order = False
+                        self.pending_start_time = None
+
+                        if data.get("status") == "CLOSED":
+                            pnl = float(data.get("pnl", 0))
+                            if pnl < 0:
+                                self.consecutive_losses += 1
+                                if (
+                                    self.consecutive_losses
+                                    >= settings.RETRAIN_ON_LOSS_COUNT
+                                    and settings.AUTO_RETRAIN
+                                ):
+                                    await self.trigger_retrain()
+                            else:
+                                self.consecutive_losses = 0
                 except Exception as e:
-                    logger.error(f"Confirm Error: {e}")
+                    logger.error(f"Event Error: {e}")
 
-    async def handle_confirmation(self, data):
-        action = data["original_action"]
-        price = data["filled_price"]
-        symbol = data["symbol"]
-
-        logger.info(f"🤝 Confirmed: {action} @ {price}")
-        self.is_pending_order = False
-        self.pending_start_time = None
-
-        if action == "BUY":
-            tp = price * (1 + settings.TAKE_PROFIT_PIPS)
-            sl = price * (1 - settings.STOP_LOSS_PIPS)
-
-            # Save DB & State
-            trade = TradeLog(
-                symbol=symbol,
-                action="BUY",
-                entry_price=price,
-                tp_price=tp,
-                sl_price=sl,
-                status="OPEN",
-            )
-            self.db.add(trade)
-            self.db.commit()
-            await state_manager.set_active_position(symbol, "BUY", price, 0.001, tp, sl)
-
-        elif action == "SELL":
-            await state_manager.clear_active_position()
+    async def trigger_retrain(self):
+        assert self.r_brain is not None
+        logger.warning("😡 Max Loss Hit. Triggering Auto-Retrain...")
+        self.is_training_mode = True
+        await self.r_brain.publish(
+            settings.CHANNEL_SYSTEM, json.dumps({"event": "TRAINING_START"})
+        )
+        subprocess.Popen([sys.executable, "train.py"])
 
     async def manage_positions(self, c):
         active_pos = await state_manager.get_active_position()
@@ -98,12 +122,12 @@ class Brain:
 
         current_price = float(c["close"])
 
-        # --- TRAILING STOP ---
+        # Trailing Stop Logic
         if active_pos["side"] == "BUY":
             entry = float(active_pos["entry_price"])
             sl = float(active_pos["sl"])
-            if (current_price - entry) / entry > 0.01:  # Profit > 1%
-                new_sl = current_price * 0.995  # SL naik
+            if (current_price - entry) / entry > 0.01:
+                new_sl = current_price * 0.995
                 if new_sl > sl:
                     active_pos["sl"] = new_sl
                     await state_manager.set_active_position(
@@ -114,49 +138,46 @@ class Brain:
                         active_pos["tp"],
                         new_sl,
                     )
-                    logger.info(f"📈 Trailing SL: {new_sl}")
+                    logger.info(f"📈 Trailing SL moved to: {new_sl}")
 
-        # --- CHECK TP/SL ---
+        # Check TP/SL locally (Backup jika broker belum close)
         high = float(c["high"])
         low = float(c["low"])
         tp = float(active_pos["tp"])
         sl = float(active_pos["sl"])
         signal_close = False
-        reason = ""
 
         if active_pos["side"] == "BUY":
             if low <= sl:
-                signal_close, reason = True, "SL Hit"
+                signal_close = True
             elif high >= tp:
-                signal_close, reason = True, "TP Hit"
+                signal_close = True
+        elif active_pos["side"] == "SELL":
+            if high >= sl:
+                signal_close = True
+            elif low <= tp:
+                signal_close = True
 
         if signal_close:
-            logger.info(f"🚨 Closing Position: {reason}")
+            logger.info(f"🚨 Close Signal Triggered locally")
             self.is_pending_order = True
             self.pending_start_time = datetime.datetime.now()
-
-            await streamor.push_signal(
-                {
-                    "action": "CLOSE_BUY",
-                    "symbol": settings.ACTIVE_SYMBOL,
-                    "entry_price": current_price,
-                    "timestamp": str(datetime.datetime.now()),
-                }
-            )
+            # Executor akan menangani close order sebenarnya di broker
 
     def is_market_open(self):
-        # 5=Sabtu, 6=Minggu -> Tutup
         return datetime.datetime.now().weekday() < 5
 
     async def run(self):
         await self.init()
-        logger.info("🧠 Brain Running...")
+        streamor.connect()
+        logger.info("🧠 Brain V1 Running (AI Inference Active)...")
 
         while True:
-            # --- TIMEOUT GUARD (Anti Deadlock) ---
+            if self.is_training_mode:
+                await asyncio.sleep(5)
+                continue
 
             if not self.is_market_open():
-                logger.info("💤 Weekend - Market Closed. Sleeping...")
                 await asyncio.sleep(300)
                 continue
 
@@ -169,14 +190,8 @@ class Brain:
                 if (
                     datetime.datetime.now() - self.pending_start_time
                 ).total_seconds() > 60:
-                    logger.warning("⚠️ Executor Timeout! Resetting State.")
                     self.is_pending_order = False
                     self.pending_start_time = None
-
-            candles = await streamor.consume_market_data()
-            if not candles:
-                await asyncio.sleep(0.1)
-                continue
 
             for c in candles:
                 self.buffer.append(c)
@@ -184,20 +199,52 @@ class Brain:
 
                 if await state_manager.get_active_position() or self.is_pending_order:
                     continue
-                if len(self.buffer) < settings.SEQ_LEN:
-                    continue
 
-                # LOGIKA MODEL DISINI (Sementara di-pass)
-                # Jika ingin tes order otomatis, ubah "HOLD" jadi "BUY" manual
+                # --- LOGIKA AI (REAL INFERENCE) ---
                 action = "HOLD"
 
-                if action == "BUY":
-                    logger.info("🚀 Signal BUY Sent")
+                if (
+                    self.model and len(self.buffer) >= settings.SEQ_LEN + 20
+                ):  # Buffer lebih utk hitung indikator
+                    try:
+                        # 1. Konversi Buffer ke DataFrame
+                        df = pd.DataFrame(list(self.buffer))
+
+                        # 2. Proses Data (Hitung RSI, EMA, lalu Scaling)
+                        # Ini menggunakan logika yang sama persis dengan train.py
+                        _, scaled_data = processor.process(df)
+
+                        # 3. Cek panjang data setelah dipotong indikator (NaN drop)
+                        if len(scaled_data) >= settings.SEQ_LEN:
+                            # Ambil SEQ_LEN terakhir
+                            input_seq = scaled_data[-settings.SEQ_LEN :]
+
+                            # 4. Konversi ke Tensor [Batch, Seq, Feature]
+                            tensor = torch.FloatTensor(input_seq).unsqueeze(0)
+
+                            # 5. Prediksi
+                            with torch.no_grad():
+                                logits = self.model(tensor)
+                                # Mapping: 0=HOLD, 1=BUY, 2=SELL (Sesuai train.py)
+                                pred = torch.argmax(logits, dim=1).item()
+
+                                if pred == 1:
+                                    action = "BUY"
+                                elif pred == 2:
+                                    action = "SELL"
+
+                    except Exception as e:
+                        logger.error(f"Prediction Error: {e}")
+
+                # Kirim Sinyal jika ada
+                if action != "HOLD":
+                    logger.info(f"🚀 AI Signal Generated: {action}")
                     self.is_pending_order = True
                     self.pending_start_time = datetime.datetime.now()
+
                     await streamor.push_signal(
                         {
-                            "action": "BUY",
+                            "action": action,
                             "symbol": settings.ACTIVE_SYMBOL,
                             "entry_price": c["close"],
                             "timestamp": str(datetime.datetime.now()),
@@ -206,5 +253,4 @@ class Brain:
 
 
 if __name__ == "__main__":
-    asyncio.run(Brain().run())
     asyncio.run(Brain().run())

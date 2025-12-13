@@ -7,36 +7,61 @@ load_dotenv()
 
 
 class Settings(BaseSettings):
-    # --- YFINANCE PAPER MODE ---
-    ASSET_TYPE: str = "FOREX"
-
-    # Gunakan simbol Yahoo Finance
-    # Contoh: "EURUSD=X", "GBPUSD=X", "USDJPY=X", "BTC-USD", "XAUUSD=X" (Gold)
+    # --- BASIC ---
     ACTIVE_SYMBOL: str = "EURUSD=X"
-
-    # Simbol Training (Sama dengan Active)
     YFINANCE_SYMBOL: str = "EURUSD=X"
-
-    # Timeframe (Format Yahoo: 1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo)
-    # Gunakan "5m" atau "15m" untuk scalping bot
     TIMEFRAME: str = "1h"
     SEQ_LEN: int = 30
-
-    # Risk Management (Simulasi)
     TRADE_UNITS: int = 1000
-    TAKE_PROFIT_PIPS: int = 20
-    STOP_LOSS_PIPS: int = 15
+    ASSET_TYPE: str = "FOREX"
 
-    # Infrastructure
-    REDIS_HOST: str = "localhost"
+    # --- INFRA ---
+    REDIS_HOST: str = "redis"  # Gunakan "localhost" jika tanpa docker
     REDIS_PORT: int = 6379
     REDIS_PASSWORD: str = ""
-    DATABASE_URL: str = "sqlite:///./trading_paper.db"
 
-    # Redis Channels
+    # Menggunakan connection string yang Anda berikan
+    DATABASE_URL: str = ""
+    # --- GRPC SERVER CONFIG ---
+    GRPC_SERVER_HOST: str = "[::]:50051"  # Port standar gRPC
+
+    # --- CHANNELS ---
     CHANNEL_MARKET: str = "channel_market"
-    CHANNEL_SIGNALS: str = "channel_signals"
+    CHANNEL_SIGNALS: str = "channel_signals"  # Output Brain V1
     CHANNEL_CONFIRMATION: str = "channel_confirmation"
+    CHANNEL_AI_ANALYSIS: str = "channel_ai_analysis"  # Output Brain V2
+    CHANNEL_SYSTEM: str = "channel_system"  # Status Training/Safety
+
+    # --- AI BRAIN V2 ---
+    GROQ_API_KEY: str = ""
+    PINECONE_API_KEY: str = ""
+    PINECONE_INDEX: str = "forex-memory"
+    NVIDIA_API_KEY: str = ""
+
+    # --- CLOUDINARY ---
+    CLOUDINARY_CLOUD_NAME: str = ""
+    CLOUDINARY_API_KEY: str = ""
+    CLOUDINARY_API_SECRET: str = ""
+    CLOUD_MODEL_NAME: str = "forex_ai_model_latest"
+
+    # --- SELF-HEALING ---
+    AUTO_RETRAIN: bool = True
+    RETRAIN_ON_LOSS_COUNT: int = 3
+
+    # --- SAFETY & RISK ---
+    MAX_DAILY_LOSS_PERCENT: float = 2.0
+    USE_ATR_FOR_SL: bool = True
+    ATR_PERIOD: int = 14
+
+    # --- NOTIFICATION ---
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""
+
+    # --- OANDA ---
+    OANDA_ACCESS_TOKEN: str = ""
+    OANDA_ENV: str = "practice"
+    OANDA_SYMBOL: str = "EUR_USD"
+    OANDA_ACCOUNT_ID: str = ""
 
     @property
     def MODEL_FILE(self) -> str:
@@ -51,4 +76,7 @@ class Settings(BaseSettings):
         env_file = ".env"
 
 
-settings = Settings()
+settings: Settings = Settings()
+
+if not os.path.exists("data"):
+    os.makedirs("data")
