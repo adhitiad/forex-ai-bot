@@ -7,12 +7,12 @@ import grpc
 
 from config import settings
 from database import MarketTick, get_db, init_db
+from logging_config import setup_logger
 
 # Import hasil generate proto
 from protos import market_pb2, market_pb2_grpc
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("DataService-GRPC")
+logger = setup_logger("DataService-GRPC")
 
 
 class MarketDataServicer(market_pb2_grpc.MarketDataServiceServicer):
@@ -20,12 +20,14 @@ class MarketDataServicer(market_pb2_grpc.MarketDataServiceServicer):
         """Menerima 1 Tick dan simpan ke DB"""
         db = next(get_db())
         try:
-            # Konversi timestamp string ke object datetime
-            # Asumsi format ISO dari yfinance
+            # Level 1 Fix: Pastikan Timezone UTC
             try:
+                # Handle ISO string format
                 ts = datetime.datetime.fromisoformat(request.timestamp)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=datetime.timezone.utc)
             except:
-                ts = datetime.datetime.utcnow()
+                ts = datetime.datetime.now(datetime.timezone.utc)
 
             new_tick = MarketTick(
                 time=ts,
@@ -35,26 +37,25 @@ class MarketDataServicer(market_pb2_grpc.MarketDataServiceServicer):
             )
             db.add(new_tick)
             db.commit()
-            return market_pb2.TickResponse(success=True, message="Saved to TimescaleDB")
+            return market_pb2.TickResponse(success=True, message="Saved")
         except Exception as e:
-            logger.error(f"DB Error: {e}")
+            logger.error(f"DB Insert Error: {e}")
             return market_pb2.TickResponse(success=False, message=str(e))
         finally:
             db.close()
 
 
 async def serve():
-    init_db()  # Pastikan Hypertable siap
-
+    init_db()  # Init DB saat service nyala
     server = grpc.aio.server()
     market_pb2_grpc.add_MarketDataServiceServicer_to_server(
         MarketDataServicer(), server
     )
 
-    # Listen di Port gRPC
-    server.add_insecure_port(settings.GRPC_SERVER_HOST)
-    logger.info(f"🚀 gRPC Data Service running on {settings.GRPC_SERVER_HOST}")
-    logger.info("🔥 Connected to TimescaleDB Cloud")
+    # Listen di Port standar gRPC
+    host = "[::]:50051"
+    server.add_insecure_port(host)
+    logger.info(f"🚀 gRPC Data Service running on {host}")
 
     await server.start()
     await server.wait_for_termination()

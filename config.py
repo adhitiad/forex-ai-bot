@@ -7,76 +7,49 @@ load_dotenv()
 
 
 class Settings(BaseSettings):
-    # --- BASIC ---
-    ACTIVE_SYMBOL: str = "EURUSD=X"
-    YFINANCE_SYMBOL: str = "EURUSD=X"
-    TIMEFRAME: str = "1h"
-    SEQ_LEN: int = 30
-    TRADE_UNITS: int = 1000
-    ASSET_TYPE: str = "FOREX"
+    # --- ASSETS ---
+    ACTIVE_SYMBOLS: list = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "XAUUSD=X"]
 
     # --- INFRA ---
-    REDIS_HOST: str = "redis"  # Gunakan "localhost" jika tanpa docker
+    REDIS_HOST: str = "redis"
     REDIS_PORT: int = 6379
-    REDIS_PASSWORD: str = ""
-
-    # Menggunakan connection string yang Anda berikan
+    REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
     DATABASE_URL: str = ""
-    # --- GRPC SERVER CONFIG ---
-    GRPC_SERVER_HOST: str = "[::]:50051"  # Port standar gRPC
 
     # --- CHANNELS ---
     CHANNEL_MARKET: str = "channel_market"
-    CHANNEL_SIGNALS: str = "channel_signals"  # Output Brain V1
+    CHANNEL_SIGNALS: str = "channel_signals"
+    CHANNEL_AI_ANALYSIS: str = "channel_ai_analysis"
     CHANNEL_CONFIRMATION: str = "channel_confirmation"
-    CHANNEL_AI_ANALYSIS: str = "channel_ai_analysis"  # Output Brain V2
-    CHANNEL_SYSTEM: str = "channel_system"  # Status Training/Safety
+    CHANNEL_SYSTEM: str = "channel_system"
 
-    # --- AI BRAIN V2 ---
-    GROQ_API_KEY: str = ""
-    PINECONE_API_KEY: str = ""
-    PINECONE_INDEX: str = "forex-memory"
-    NVIDIA_API_KEY: str = ""
+    # --- API KEYS ---
+    OANDA_ACCESS_TOKEN: str = os.getenv("OANDA_ACCESS_TOKEN", "")
+    OANDA_ACCOUNT_ID: str = os.getenv("OANDA_ACCOUNT_ID", "")
+    OANDA_ENV: str = os.getenv("OANDA_ENV", "practice")
 
-    # --- CLOUDINARY ---
-    CLOUDINARY_CLOUD_NAME: str = ""
-    CLOUDINARY_API_KEY: str = ""
-    CLOUDINARY_API_SECRET: str = ""
-    CLOUD_MODEL_NAME: str = "forex_ai_model_latest"
+    HUGGINGFACE_API_TOKEN: str = os.getenv("HUGGINGFACE_API_TOKEN", "")
+    HF_MODEL_ID: str = "zai-org/GLM-4.6"
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    GROQ_MODEL_ID: str = "llama3-70b-8192"
 
-    # --- SELF-HEALING ---
-    AUTO_RETRAIN: bool = True
-    RETRAIN_ON_LOSS_COUNT: int = 3
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # --- SAFETY & RISK ---
-    MAX_DAILY_LOSS_PERCENT: float = 2.0
-    USE_ATR_FOR_SL: bool = True
-    ATR_PERIOD: int = 14
+    # --- RISK & LOGIC ---
+    MAX_OPEN_POSITIONS: int = 3
+    MAX_DAILY_LOSS_PERCENT: float = 3.0
+    VOLATILITY_THRESHOLD: float = 0.0025
+    EXECUTION_MODE: str = "SMART"  # SMART or STANDARD
+    LIMIT_CHASE_TIMEOUT: int = 20
 
-    # --- NOTIFICATION ---
-    TELEGRAM_BOT_TOKEN: str = ""
-    TELEGRAM_CHAT_ID: str = ""
-
-    # --- OANDA ---
-    OANDA_ACCESS_TOKEN: str = ""
-    OANDA_ENV: str = "practice"
-    OANDA_SYMBOL: str = "EUR_USD"
-    OANDA_ACCOUNT_ID: str = ""
-
-    @property
-    def MODEL_FILE(self) -> str:
-        return f"data/forex_model.pth"
-
-    @property
-    def SCALER_FILE(self) -> str:
-        return f"data/forex_scaler.pkl"
-
-    class Config:
-        extra = "ignore"
-        env_file = ".env"
+    SEQ_LEN: int = 60  # Panjang Sequence untuk Model
+    PREDICTION_WINDOW: int = 15  # Jendela Prediksi (15 candle ke depan)
+    STRIDE: int = 1  # Langkah untuk Sliding Window
+    BATCH_SIZE: int = 64  # Ukuran Batch untuk Training
+    LEARNING_RATE: float = 1e-4  # Learning Rate untuk Optimizer
+    WEIGHT_DECAY: float = 1e-5  # Weight Decay untuk Optimizer
+    GRADIENT_CLIP: float = 1.0  # Gradient Clipping untuk Stabilitas
 
 
-settings: Settings = Settings()
-
-if not os.path.exists("data"):
-    os.makedirs("data")
+settings = Settings()
