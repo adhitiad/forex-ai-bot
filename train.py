@@ -10,7 +10,7 @@ import torch.optim as optim
 from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader, TensorDataset
 
-# Import modul internal
+# Import internal
 from cloud_manager import cloud_manager
 from config import settings
 from features import fetcher, processor
@@ -23,60 +23,92 @@ logger = logging.getLogger("Trainer")
 async def train():
     logger.info(f"🚀 Training for {settings.ACTIVE_SYMBOLS[0]}...")
 
-    # 1. Ambil Data (Misal 2 Tahun)
+    # 1. Ambil Data
     df = await fetcher.fetch_market_data(days=730)
     if df.empty:
-        logger.error("❌ Data kosong. Training dibatalkan.")
+        logger.error("❌ Data kosong.")
         return
 
-    # 2. Preprocessing (Fit scaler hanya pada data awal, idealnya split dulu baru scale)
-    # Untuk simplifikasi, kita gunakan logic processor yang sudah diperbaiki (Cek step sebelumnya)
-    df, scaled = processor.process(df, is_training=True)
+    # 2. Add Indicators (BELUM DI-SCALE)
+    df = processor.add_indicators(df)
+    if df.empty:
+        return
 
-    X, y = [], []
-    prediction_window = settings.PREDICTION_WINDOW  # Default 15 candle ke depan
-    THRESHOLD = settings.VOLATILITY_THRESHOLD  # Default 0.0025
+    # 3. Split Data (Training 80%, Val 20%) - TIME SERIES SPLIT (Tanpa Shuffle)
+    split_idx = int(len(df) * 0.8)
+    train_df = df.iloc[:split_idx].copy()
+    val_df = df.iloc[split_idx:].copy()
 
-    # 3. Labeling
-    for i in range(len(scaled) - settings.SEQ_LEN - prediction_window):
-        # Input: Sequence candle terakhir
-        X.append(scaled[i : i + settings.SEQ_LEN])
+    logger.info(f"Data Split: Train Rows={len(train_df)} | Val Rows={len(val_df)}")
 
-        # Target: Harga masa depan
-        curr = df.iloc[i + settings.SEQ_LEN]["close"]
-        fut = df.iloc[i + settings.SEQ_LEN + prediction_window]["close"]
-        diff = (fut - curr) / curr
+    # 4. Fit Scaler ONLY on Training Data
+    processor.fit_scaler(train_df)
 
-        if diff > THRESHOLD:
-            y.append(1)  # BUY
-        elif diff < -THRESHOLD:
-            y.append(2)  # SELL
-        else:
-            y.append(0)  # HOLD
+    # 5. Transform Data
+    train_scaled = processor.transform(train_df)
+    val_scaled = processor.transform(val_df)
 
-    X, y = np.array(X), np.array(y)
+    # 6. Fungsi Helper membuat Sequence
+    def create_sequences(data_scaled, original_close, seq_len, pred_window, threshold):
+        X, y = [], []
+        # original_close harus align dengan data_scaled
+        # Kita butuh index reset agar iloc mudah
+        closes = original_close.values
 
-    # 4. SPLIT TRAIN/VAL (SEKUENSIAL - WAJIB!)
-    # Jangan di-shuffle sebelum split!
-    split_idx = int(len(X) * 0.8)  # 80% Training, 20% Validasi
+        for i in range(len(data_scaled) - seq_len - pred_window):
+            # Input
+            X.append(data_scaled[i : i + seq_len])
 
-    X_train, X_val = X[:split_idx], X[split_idx:]
-    y_train, y_val = y[:split_idx], y[split_idx:]
+            # Target (Melihat masa depan dari sequence terakhir)
+            curr = closes[i + seq_len]
+            fut = closes[i + seq_len + pred_window]
+            diff = (fut - curr) / curr
 
-    logger.info(f"Data Split: Train={len(X_train)} | Val={len(X_val)}")
+            if diff > threshold:
+                y.append(1)  # BUY
+            elif diff < -threshold:
+                y.append(2)  # SELL
+            else:
+                y.append(0)  # HOLD
 
-    # Hitung bobot kelas hanya dari data training
-    class_weights = compute_class_weight(
-        "balanced", classes=np.unique(y_train), y=y_train
+        return np.array(X), np.array(y)
+
+    # Buat Sequence untuk Train dan Val terpisah
+    logger.info("⏳ Creating Sequences...")
+    X_train, y_train = create_sequences(
+        train_scaled,
+        train_df["close"],
+        settings.SEQ_LEN,
+        settings.PREDICTION_WINDOW,
+        settings.VOLATILITY_THRESHOLD,
     )
-    full_weights = torch.tensor(class_weights, dtype=torch.float)
 
-    # Dataset & Loader
-    # Shuffle=True HANYA BOLEH di Training set setelah di-split
+    X_val, y_val = create_sequences(
+        val_scaled,
+        val_df["close"],
+        settings.SEQ_LEN,
+        settings.PREDICTION_WINDOW,
+        settings.VOLATILITY_THRESHOLD,
+    )
+
+    if len(X_train) == 0 or len(X_val) == 0:
+        logger.error("❌ Sequence generation failed (not enough data).")
+        return
+
+    # 7. Class Weights & DataLoader
+    classes = np.unique(y_train)
+    weights = compute_class_weight("balanced", classes=classes, y=y_train)
+    # Pastikan weights mencakup 3 kelas (0,1,2)
+    full_weights = torch.ones(3)
+    for c, w in zip(classes, weights):
+        full_weights[c] = w
+
+    logger.info(f"Class Weights: {full_weights}")
+
     train_loader = DataLoader(
         TensorDataset(torch.FloatTensor(X_train), torch.LongTensor(y_train)),
         batch_size=settings.BATCH_SIZE,
-        shuffle=True,
+        shuffle=True,  # Shuffle OK disini karena sudah bentuk window
     )
     val_loader = DataLoader(
         TensorDataset(torch.FloatTensor(X_val), torch.LongTensor(y_val)),
@@ -84,51 +116,58 @@ async def train():
         shuffle=False,
     )
 
+    # 8. Model Setup
     model = TimeSeriesTransformer(input_dim=4, output_dim=3)
     criterion = nn.CrossEntropyLoss(weight=full_weights)
     optimizer = optim.Adam(model.parameters(), lr=settings.LEARNING_RATE)
 
-    # 5. Training Loop dengan Evaluasi
+    # 9. Training Loop
     best_acc = 0.0
+    patience = 5
+    no_improve = 0
 
-    for epoch in range(20):
+    for epoch in range(30):  # Naikkan epoch
         model.train()
         total_loss = 0
 
-        for batch_X, batch_y in train_loader:
+        for bx, by in train_loader:
             optimizer.zero_grad()
-            out = model(batch_X)
-            loss = criterion(out, batch_y)
+            out = model(bx)
+            loss = criterion(out, by)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
 
-        # Evaluasi (Validation)
+        # Validation
         model.eval()
         correct = 0
         total = 0
         with torch.no_grad():
-            for val_X, val_y in val_loader:
-                out = model(val_X)
-                preds = torch.argmax(out, dim=1)
-                correct += (preds == val_y).sum().item()
-                total += val_y.size(0)
+            for vx, vy in val_loader:
+                out = model(vx)
+                pred = torch.argmax(out, dim=1)
+                correct += (pred == vy).sum().item()
+                total += vy.size(0)
 
         val_acc = correct / total
         logger.info(
-            f"Epoch {epoch+1} | Loss: {total_loss/len(train_loader):.4f} | Val Acc: {val_acc*100:.2f}%"
+            f"Ep {epoch+1} | Loss: {total_loss/len(train_loader):.4f} | Val Acc: {val_acc*100:.2f}%"
         )
 
-        # Save Best Model Only
         if val_acc > best_acc:
             best_acc = val_acc
             torch.save(model.state_dict(), settings.MODEL_FILE)
-            logger.info("✅ New Best Model Saved!")
+            no_improve = 0
+            logger.info("✅ Best Model Saved")
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                logger.info("Early stopping triggered.")
+                break
 
-    # 6. Upload & Notify
+    # 10. Upload & Notify
     await asyncio.to_thread(cloud_manager.upload_model)
 
-    # Notify System
     try:
         r = redis.Redis(
             host=settings.REDIS_HOST,
