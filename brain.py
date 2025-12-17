@@ -8,6 +8,7 @@ import sys
 from collections import deque
 from typing import cast
 
+import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd  # Wajib ada untuk proses data
 import redis.asyncio as redis
@@ -15,7 +16,7 @@ import torch
 
 from cloud_manager import cloud_manager
 from config import settings
-from database import TradeLog, get_db
+from database import get_db
 from features import processor  # Import processor untuk scaling data
 from model import TimeSeriesTransformer
 from state_manager import state_manager
@@ -167,9 +168,40 @@ class Brain:
     def is_market_open(self):
         return datetime.datetime.now().weekday() < 5
 
+    def warmup_data(self):
+        """Isi buffer dengan data historis agar indikator akurat"""
+        if not mt5.initialize():
+            logger.error("❌ MT5 Init Failed for Warmup")
+            return
+
+        symbol = settings.ACTIVE_SYMBOLS[0]  # Ambil simbol aktif
+        logger.info(f"🔥 Warming up brain with data for {symbol}...")
+
+        # Ambil 200 candle terakhir (M1 atau sesuai timeframe)
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 200)
+
+        if rates is not None:
+            for rate in rates:
+                # Format harus sama dengan stream_manager
+                c = {
+                    "symbol": symbol,
+                    "close": float(rate["close"]),
+                    "open": float(rate["open"]),
+                    "high": float(rate["high"]),
+                    "low": float(rate["low"]),
+                    "volume": float(rate["tick_volume"]),
+                    "timestamp": str(rate["time"]),
+                }
+                self.buffer.append(c)
+            logger.info(f"✅ Brain Warmed up! Buffer size: {len(self.buffer)}")
+        else:
+            logger.warning("⚠️ Failed to get history. Brain starts COLD (Risk high!)")
+
     async def run(self):
         await self.init()
-        streamor.connect()
+        await streamor.connect()
+        self.warmup_data()
+
         logger.info("🧠 Brain V1 Running (AI Inference Active)...")
 
         while True:
@@ -245,7 +277,7 @@ class Brain:
                     await streamor.push_signal(
                         {
                             "action": action,
-                            "symbol": settings.ACTIVE_SYMBOL,
+                            "symbol": settings.ACTIVE_SYMBOLS[0],
                             "entry_price": c["close"],
                             "timestamp": str(datetime.datetime.now()),
                         }

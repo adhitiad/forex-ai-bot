@@ -14,7 +14,7 @@ class StreamManager:
     def __init__(self):
         self.r = None
 
-    def connect(self):
+    async def connect(self):
         try:
             kwargs = {
                 "host": settings.REDIS_HOST,
@@ -24,6 +24,8 @@ class StreamManager:
             if settings.REDIS_PASSWORD:
                 kwargs["password"] = settings.REDIS_PASSWORD
             self.r = redis.Redis(**kwargs)
+            # Test connection
+            await self.r.ping()
             logger.info("✅ Redis Connected")
         except Exception as e:
             logger.error(f"❌ Redis Error: {e}")
@@ -63,4 +65,3 @@ class StreamManager:
 
 
 streamor = StreamManager()
-streamor.connect()

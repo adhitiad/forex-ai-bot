@@ -22,62 +22,74 @@ class PortfolioManager:
                 decode_responses=True,
             )
 
-    async def get_open_positions(self):
-        """Hitung jumlah posisi aktif dari Redis"""
+    async def get_account_info(self):
+        """Ambil info saldo real-time yang di-update oleh Executor"""
         await self.connect()
-        keys = await self.r.keys("position:*")
-        return len(keys)
+        # Executor MT5 sekarang rajin update key ini
+        balance = float(await self.r.get("account_balance") or 0.0)
+        equity = float(await self.r.get("account_equity") or 0.0)
+        margin_free = float(await self.r.get("account_margin_free") or 0.0)
+
+        # Fallback jika Redis kosong (belum sync)
+        if balance == 0:
+            logger.warning("⚠️ Saldo Redis Kosong. Defaulting to 1000.")
+            balance = 1000.0
+
+        return balance, equity, margin_free
+
+    async def get_open_positions_count(self):
+        """Hitung posisi aktif (bisa ambil dari Redis state manager)"""
+        await self.connect()
+        # Hitung key position:* (tapi state manager sekarang handle ini)
+        # Lebih aman tanya State Manager atau cek key spesifik
+        # Simplifikasi: Cek state
+        state = await self.r.get(f"bot_state:{settings.ACTIVE_SYMBOLS[0]}")
+        return 1 if state else 0
 
     async def calculate_allocation(self, symbol, confidence):
-        """
-        Inti Logika Manajemen Risiko (Kelly Criterion Simplified)
-        """
+        """Logic Manajemen Risiko (Fixed Lot / Kelly)"""
         await self.connect()
+
+        balance, equity, free_margin = await self.get_account_info()
+        open_count = await self.get_open_positions_count()
 
         # 1. Cek Max Positions
-        open_count = await self.get_open_positions()
         if open_count >= settings.MAX_OPEN_POSITIONS:
-            return (
-                False,
-                0.0,
-                f"⛔ Max Positions ({open_count}/{settings.MAX_OPEN_POSITIONS})",
-            )
+            return False, 0.0, f"⛔ Max Positions ({open_count})"
 
-        # 2. Ambil Equity (Simulasi atau Real)
-        bal_str = await self.r.get("account_balance")
-        balance = float(bal_str) if bal_str else 10000.0
+        # 2. Cek Margin Cukup
+        if free_margin < 50:  # $50 safety buffer
+            return False, 0.0, "⛔ Low Margin"
 
-        # 3. Hitung Risk Amount ($)
-        # Risiko standar 1.5% dari equity per trade (setting di config)
-        # Tapi kita pakai default 1% jika tidak ada di config
-        risk_pct = getattr(settings, "RISK_PER_TRADE", 0.01)
-        risk_amount = balance * risk_pct
+        # 3. Lot Sizing (PENTING UNTUK MT5)
+        # OANDA pakai 'units' (1000, 5000). MT5 pakai 'lot' (0.01, 0.1).
+        # Rumus sederhana: Risk 1% dari Equity
+        risk_per_trade = 0.01  # 1%
+        risk_amount = equity * risk_per_trade
 
-        # 4. Sesuaikan dengan Confidence AI (Level 2 Logic)
+        # Estimasi SL 200 point (20 pips)
+        # 1 Lot Standard = $10 per pip (approx)
+        # Value per pip untuk 1 lot ~ $10
+        stop_loss_pips = 20
+        pip_value_1_lot = 10.0  # Estimasi kasar EURUSD
+
+        # Risk = Lots * SL_Pips * Pip_Value
+        # Lots = Risk / (SL_Pips * Pip_Value)
+        lots = risk_amount / (stop_loss_pips * pip_value_1_lot)
+
+        # Rounding ke step 0.01
+        lots = round(max(0.01, lots), 2)
+
+        # Adjustment berdasarkan Confidence AI
         if confidence > 0.8:
-            risk_amount *= 1.25  # Aggressive
+            lots = round(lots * 1.2, 2)  # Aggressive
         elif confidence < 0.6:
-            risk_amount *= 0.5  # Defensive
+            lots = round(lots * 0.5, 2)  # Conservative
 
-        # 5. Konversi $ Risk ke Units (Lot)
-        # Asumsi SL rata-rata 20 pips (0.0020) untuk pair Forex
-        sl_distance = 0.0020
-        units = int(risk_amount / sl_distance)
+        # Cap Max Lot (Safety)
+        lots = min(lots, 1.0)  # Jangan lebih dari 1 lot
 
-        # Min units Oanda = 1
-        if units < 1:
-            units = 100  # Micro lot minimum safety
-
-        return True, units, f"✅ Alloc: {units} units (${risk_amount:.2f} risk)"
-
-    async def register_position(self, symbol, data):
-        await self.connect()
-        await self.r.set(f"position:{symbol}", json.dumps(data))
-
-    async def close_position(self, symbol):
-        await self.connect()
-        await self.r.delete(f"position:{symbol}")
+        return True, lots, f"✅ Alloc: {lots} Lots (${risk_amount:.2f} risk)"
 
 
-# Singleton Instance
-portfolio = PortfolioManager()  # Singleton Instance
+portfolio = PortfolioManager()

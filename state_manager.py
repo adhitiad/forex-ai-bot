@@ -19,7 +19,7 @@ class StateManager:
         if settings.REDIS_PASSWORD:
             kwargs["password"] = settings.REDIS_PASSWORD
         self.r = redis.Redis(**kwargs)
-        self.KEY_STATE = f"bot_state:{settings.ACTIVE_SYMBOL}"
+        self.KEY_STATE = f"bot_state:{settings.ACTIVE_SYMBOLS[0]}"
         self.KEY_DAILY_PNL = f"bot_stats:daily_pnl:{datetime.date.today()}"
 
     async def get_active_position(self):
@@ -60,8 +60,8 @@ class StateManager:
         mode = await self.r.get("trading_mode")
         if mode:
             return mode
-        # Default: LIVE if OANDA credentials are set, else PAPER
-        return "LIVE" if settings.OANDA_ACCESS_TOKEN else "PAPER"
+        # Default: LIVE if MT5 credentials are set, else PAPER
+        return "LIVE" if settings.MT5_LOGIN else "PAPER"
 
     async def set_trading_mode(self, mode: str):
         # Store the trading mode in Redis (optional, for manual override)
@@ -79,7 +79,7 @@ class StateManager:
 
         # Fallback ke settings bawaan jika Redis kosong
         return {
-            "symbol": sym if sym else settings.ACTIVE_SYMBOL,
+            "symbol": sym if sym else settings.ACTIVE_SYMBOLS[0],
             "timeframe": tf if tf else settings.TIMEFRAME,
         }
 

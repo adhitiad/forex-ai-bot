@@ -38,9 +38,14 @@ def eval_remote(ind):
 
 class GeneticLab:
     def __init__(self):
-        self.r = redis.Redis(
-            host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True
-        )
+        kwargs = {
+            "host": settings.REDIS_HOST,
+            "port": settings.REDIS_PORT,
+            "decode_responses": True,
+        }
+        if settings.REDIS_PASSWORD:
+            kwargs["password"] = settings.REDIS_PASSWORD
+        self.r = redis.Redis(**kwargs)
         self.toolbox = base.Toolbox()
         self.toolbox.register("attr_float", random.uniform, 0.1, 2.0)
         self.toolbox.register(

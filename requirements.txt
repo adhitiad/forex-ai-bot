@@ -38,3 +38,5 @@ scipy
 seaborn
 MetaTrader5
 protobuf
+python-telegram-bot
+streamlit

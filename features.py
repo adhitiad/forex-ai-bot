@@ -5,13 +5,42 @@ import os
 import joblib
 import numpy as np
 import pandas as pd
-import pandas_ta
 import yfinance as yf
 from sklearn.preprocessing import RobustScaler
 
 from config import settings
 
 logger = logging.getLogger("Features")
+
+
+def calculate_rsi(series, period=14):
+    """Calculate Relative Strength Index"""
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+def calculate_ema(series, period=20):
+    """Calculate Exponential Moving Average"""
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def calculate_atr(df, period=14):
+    """Calculate Average True Range"""
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return atr
 
 
 class DataFetcher:
@@ -65,9 +94,9 @@ class FeatureEngineer:
         df = df.copy()
 
         df["returns"] = df["close"].pct_change()
-        df.ta.rsi(length=14, append=True)
-        df.ta.ema(length=20, append=True)
-        df.ta.atr(length=14, append=True)
+        df["RSI_14"] = calculate_rsi(df["close"], period=14)
+        df["EMA_20"] = calculate_ema(df["close"], period=20)
+        df["ATRr_14"] = calculate_atr(df, period=14)
         df.dropna(inplace=True)
 
         if df.empty:

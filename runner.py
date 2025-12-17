@@ -1,4 +1,5 @@
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -7,73 +8,128 @@ import time
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("Runner")
+logger = logging.getLogger("Enterprise-Runner")
 
+# Path ke Python Interpreter saat ini (vEnv)
 python_cmd = sys.executable
 
-# Daftar Script yang akan dijalankan bersamaan
-cmds = [
-    # 1. API Backend (FastAPI)
-    [python_cmd, "data_service.py"],
-    # 2. Ingestor (gRPC Client)
-    [python_cmd, "ingestor.py"],
-    # 3. Backend API
-    [python_cmd, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"],
-    # 3. Brain V1 (Analisis Teknikal & Self-Healing)
-    [python_cmd, "brain.py"],
-    # 4. Brain V2 (Fusion AI: Berita + Sentimen + ATR)
-    [python_cmd, "second_brain.py"],
-    # 5. Executor (Eksekusi Order ke OANDA / Paper)
-    [python_cmd, "executor.py"],
-    # 6. Notifier (Kirim Alert ke Telegram)
-    # [python_cmd, "notifier.py"],
+# --- DAFTAR LAYANAN ENTERPRISE ---
+# Format: {"name": "Nama Service", "cmd": ["command", "arg1", ...]}
+services = [
+    # 1. MATA & TELINGA (Data Ingestion)
+    {"name": "Ingestor (MT5)", "cmd": [python_cmd, "ingestor.py"]},
+    {"name": "Macro Guardian", "cmd": [python_cmd, "macro_engine.py"]},
+    # 2. OTAK & ANALISIS (The Council)
+    {"name": "Brain V1 (Technical)", "cmd": [python_cmd, "brain.py"]},
+    {"name": "Brain RL (Adaptive)", "cmd": [python_cmd, "brain_rl.py"]},
+    {"name": "LLM Strategist (Fundamental)", "cmd": [python_cmd, "llm_strategist.py"]},
+    # 3. PENGAMBIL KEPUTUSAN (The Chairman)
+    {"name": "Fusion Engine (Core Logic)", "cmd": [python_cmd, "fusion_engine.py"]},
+    # 4. EKSEKUTOR (The Hand)
+    {"name": "Executor (MT5)", "cmd": [python_cmd, "executor.py"]},
+    # # 5. KOMUNIKASI & MONITORING
+    # {"name": "Notifier (Telegram)", "cmd": [python_cmd, "notifier.py"]},
+    {
+        "name": "API Gateway",
+        "cmd": [
+            python_cmd,
+            "-m",
+            "uvicorn",
+            "main:app",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8000",
+        ],
+    },
+    # {
+    #     "name": "Control Tower (Dashboard)",
+    #     # Streamlit butuh command khusus "streamlit run"
+    #     # Kita panggil via modul python -m streamlit
+    #     "cmd": [
+    #         python_cmd,
+    #         "-m",
+    #         "streamlit",
+    #         "run",
+    #         "dashboard.py",
+    #         "--server.port",
+    #         "8501",
+    #         "--server.headless",
+    #         "true",
+    #     ],
+    # },
 ]
 
-procs = []
+# Dictionary untuk menyimpan proses yang aktif
+active_procs = {}
 
 
-def start_processes():
-    logger.info(f"🚀 Starting Forex AI Bot System ({len(cmds)} Services)...")
-    processes = []
-    for cmd in cmds:
-        # Menjalankan setiap script sebagai subprocess
-        p = subprocess.Popen(cmd)
-        processes.append(p)
-        logger.info(f"✅ Started: {' '.join(cmd)}")
-        time.sleep(1)  # Beri jeda sedikit agar tidak crash barengan saat start
-    return processes
+def start_service(svc):
+    """Menjalankan satu service"""
+    try:
+        logger.info(f"🚀 Starting {svc['name']}...")
+        # Start subprocess (non-blocking)
+        p = subprocess.Popen(svc["cmd"], shell=False)
+        active_procs[svc["name"]] = p
+    except Exception as e:
+        logger.error(f"❌ Failed to start {svc['name']}: {e}")
 
 
-def stop_processes(processes):
-    logger.info("\n🛑 Shutting down all services...")
-    for p in processes:
+def stop_all():
+    """Mematikan semua service dengan rapi"""
+    logger.info("\n🛑 SHUTDOWN SEQUENCE INITIATED...")
+    for name, p in active_procs.items():
         try:
+            logger.info(f"Killing {name}...")
             p.terminate()
-            p.wait(timeout=5)
+            p.wait(timeout=3)
         except:
-            p.kill()
+            p.kill()  # Paksa bunuh jika bandel
     logger.info("👋 All systems offline.")
 
 
-if __name__ == "__main__":
+def monitor_loop():
+    """Loop utama untuk menjaga service tetap hidup (Self-Healing)"""
+
+    # 1. Start Awal Semua Service
+    logger.info(f"⚡ Booting up Forex AI Enterprise ({len(services)} Services)...")
+    for svc in services:
+        start_service(svc)
+        # Beri jeda sedikit agar Redis tidak kaget (Connection spike)
+        time.sleep(1.5)
+
+    logger.info("✅ System Fully Operational. Press CTRL+C to stop.")
+
+    # 2. Watchdog Loop
     try:
-        procs = start_processes()
-
-        # Loop utama agar script tidak mati
         while True:
-            time.sleep(1)
+            time.sleep(5)  # Cek setiap 5 detik
 
-            # Cek jika ada proses yang mati mendadak (Crash)
-            for i, p in enumerate(procs):
-                if p.poll() is not None:
-                    dead_cmd = cmds[i]
-                    logger.warning(f"⚠️ Process DIED: {dead_cmd[1]}. Restarting...")
-                    # Restart proses yang mati
-                    procs[i] = subprocess.Popen(dead_cmd)
+            for svc in services:
+                name = svc["name"]
+                proc = active_procs.get(name)
+
+                # Cek apakah proses mati (poll() returns exit code if dead, None if alive)
+                if proc is None or proc.poll() is not None:
+                    exit_code = proc.poll() if proc else "N/A"
+                    logger.warning(
+                        f"⚠️ ALERT: Service '{name}' DIED (Code: {exit_code}). Restarting in 3s..."
+                    )
+
+                    # Restart Service
+                    time.sleep(3)
+                    start_service(svc)
 
     except KeyboardInterrupt:
-        # Tangkap CTRL+C untuk mematikan semua dengan rapi
-        stop_processes(procs)
+        stop_all()
     except Exception as e:
-        logger.error(f"❌ Runner Error: {e}")
-        stop_processes(procs)
+        logger.error(f"Critical Runner Error: {e}")
+        stop_all()
+
+
+if __name__ == "__main__":
+    # Pastikan folder logs ada (opsional)
+    if not os.path.exists("logs"):
+        os.makedirs("logs")
+
+    monitor_loop()

@@ -10,9 +10,14 @@ logger = setup_logger("SocialSensor")
 
 
 async def run():
-    r = redis.Redis(
-        host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True
-    )
+    kwargs = {
+        "host": settings.REDIS_HOST,
+        "port": settings.REDIS_PORT,
+        "decode_responses": True,
+    }
+    if settings.REDIS_PASSWORD:
+        kwargs["password"] = settings.REDIS_PASSWORD
+    r = redis.Redis(**kwargs)
     logger.info("🐦 Social Sensor Started")
     while True:
         try:
