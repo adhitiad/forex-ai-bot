@@ -11,7 +11,8 @@ env.bak/
 venv.bak/
 
 __pycache__
-
+.zip
+.max_steps
 dakocan
 
 trained_model.pth
