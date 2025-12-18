@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     # --- RISK & LOGIC ---
     MAX_OPEN_POSITIONS: int = 3
     MAX_DAILY_LOSS_PERCENT: float = 3.0
-    VOLATILITY_THRESHOLD: float = 0.0025
+    VOLATILITY_THRESHOLD: float = 0.0050
     EXECUTION_MODE: str = "SMART"
     LIMIT_CHASE_TIMEOUT: int = 20
     RETRAIN_ON_LOSS_COUNT: int = 5

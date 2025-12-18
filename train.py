@@ -7,6 +7,7 @@ import redis.asyncio as redis
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from sklearn.metrics import confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -118,7 +119,7 @@ async def train():
 
     # 8. Model Setup
     model = TimeSeriesTransformer(input_dim=4, output_dim=3)
-    criterion = nn.CrossEntropyLoss(weight=full_weights)
+    criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=settings.LEARNING_RATE)
 
     # 9. Training Loop
@@ -153,7 +154,23 @@ async def train():
         logger.info(
             f"Ep {epoch+1} | Loss: {total_loss/len(train_loader):.4f} | Val Acc: {val_acc*100:.2f}%"
         )
+        # --- TAMBAHAN DEBUGGING ---
+        # Kumpulkan semua prediksi validasi
+        all_preds = []
+        all_targets = []
+        with torch.no_grad():
+            for vx, vy in val_loader:
+                out = model(vx)
+                preds = torch.argmax(out, dim=1)
+                all_preds.extend(preds.numpy())
+            all_targets.extend(vy.numpy())
 
+        cm = confusion_matrix(all_targets, all_preds)
+        logger.info(f"Confusion Matrix:\n{cm}")
+
+        # --- TAMBAHAN DEBUGGING ---
+
+        # Early Stopping
         if val_acc > best_acc:
             best_acc = val_acc
             torch.save(model.state_dict(), settings.MODEL_FILE)
@@ -163,11 +180,12 @@ async def train():
             no_improve += 1
             if no_improve >= patience:
                 logger.info("Early stopping triggered.")
-                break
+            break
 
     # 10. Upload & Notify
     await asyncio.to_thread(cloud_manager.upload_model)
 
+    # train.py (Bagian bawah)
     try:
         r = redis.Redis(
             host=settings.REDIS_HOST,
@@ -177,7 +195,7 @@ async def train():
         await r.publish(
             settings.CHANNEL_SYSTEM, json.dumps({"event": "TRAINING_COMPLETED"})
         )
-        await r.close()
+        await r.aclose()  # <--- GANTI INI (Pakai aclose)
     except:
         pass
 

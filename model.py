@@ -57,3 +57,19 @@ class TimeSeriesTransformer(nn.Module):
         # 4. MATH FIX: Hapus Softmax
         # Kembalikan Logits murni untuk kestabilan training
         return self.decoder(x)
+
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim=4, hidden_dim=64, num_layers=2, output_dim=3):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.2
+        )
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        # x shape: (Batch, Seq, Feature)
+        out, _ = self.lstm(x)
+        # Ambil output dari langkah terakhir saja
+        out = out[:, -1, :]
+        return self.fc(out)
