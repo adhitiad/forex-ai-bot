@@ -10,20 +10,18 @@ from typing import cast
 
 import MetaTrader5 as mt5
 import numpy as np
-import pandas as pd  # Wajib ada untuk proses data
+import pandas as pd
 import redis.asyncio as redis
 import torch
+import torch.nn.functional as F
 
 from cloud_manager import cloud_manager
 from config import settings
 from database import get_db
-from features import processor  # Import processor untuk scaling data
+from features import processor
 from model import TimeSeriesTransformer
 from state_manager import state_manager
 from stream_manager import streamor
-
-# brain.py
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Brain-V1")
@@ -31,16 +29,11 @@ logger = logging.getLogger("Brain-V1")
 
 class Brain:
     def __init__(self):
-        # Buffer dilebihkan sedikit dari SEQ_LEN agar indikator teknikal (RSI/EMA) bisa terhitung
         self.buffer = deque(maxlen=settings.SEQ_LEN + 50)
         self.model = None
         self.r_brain = None
-
-        # State Self-Healing
         self.consecutive_losses = 0
         self.is_training_mode = False
-
-        # State Trading
         self.is_pending_order = False
         self.pending_start_time = None
 
@@ -63,7 +56,7 @@ class Brain:
 
         try:
             self.model.load_state_dict(torch.load(settings.MODEL_FILE))
-            self.model.eval()  # Set mode evaluasi (bukan training)
+            self.model.eval()
             logger.info("🧠 AI Model Loaded Successfully.")
         except:
             logger.warning("⚠️ Model not found or corrupt. Running Logic Only.")
@@ -91,7 +84,6 @@ class Brain:
                     elif channel == settings.CHANNEL_CONFIRMATION:
                         self.is_pending_order = False
                         self.pending_start_time = None
-
                         if data.get("status") == "CLOSED":
                             pnl = float(data.get("pnl", 0))
                             if pnl < 0:
@@ -122,8 +114,6 @@ class Brain:
             return
 
         current_price = float(c["close"])
-
-        # Trailing Stop Logic
         if active_pos["side"] == "BUY":
             entry = float(active_pos["entry_price"])
             sl = float(active_pos["sl"])
@@ -141,7 +131,6 @@ class Brain:
                     )
                     logger.info(f"📈 Trailing SL moved to: {new_sl}")
 
-        # Check TP/SL locally (Backup jika broker belum close)
         high = float(c["high"])
         low = float(c["low"])
         tp = float(active_pos["tp"])
@@ -149,40 +138,29 @@ class Brain:
         signal_close = False
 
         if active_pos["side"] == "BUY":
-            if low <= sl:
-                signal_close = True
-            elif high >= tp:
+            if low <= sl or high >= tp:
                 signal_close = True
         elif active_pos["side"] == "SELL":
-            if high >= sl:
-                signal_close = True
-            elif low <= tp:
+            if high >= sl or low <= tp:
                 signal_close = True
 
         if signal_close:
             logger.info(f"🚨 Close Signal Triggered locally")
             self.is_pending_order = True
             self.pending_start_time = datetime.datetime.now()
-            # Executor akan menangani close order sebenarnya di broker
 
     def is_market_open(self):
-        return datetime.datetime.now().weekday() < 5
+        return True
 
     def warmup_data(self):
-        """Isi buffer dengan data historis agar indikator akurat"""
         if not mt5.initialize():
             logger.error("❌ MT5 Init Failed for Warmup")
             return
-
-        symbol = settings.ACTIVE_SYMBOLS[0]  # Ambil simbol aktif
+        symbol = settings.ACTIVE_SYMBOLS[0]
         logger.info(f"🔥 Warming up brain with data for {symbol}...")
-
-        # Ambil 200 candle terakhir (M1 atau sesuai timeframe)
         rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 200)
-
         if rates is not None:
             for rate in rates:
-                # Format harus sama dengan stream_manager
                 c = {
                     "symbol": symbol,
                     "close": float(rate["close"]),
@@ -194,8 +172,26 @@ class Brain:
                 }
                 self.buffer.append(c)
             logger.info(f"✅ Brain Warmed up! Buffer size: {len(self.buffer)}")
+
+    def generate_explanation(self, rsi, price, ema):
+        """Membuat alasan logis (Keterangan) berdasarkan indikator"""
+        reasons = []
+
+        # Analisis RSI
+        if rsi > 70:
+            reasons.append(f"RSI Overbought({rsi:.0f})")
+        elif rsi < 30:
+            reasons.append(f"RSI Oversold({rsi:.0f})")
         else:
-            logger.warning("⚠️ Failed to get history. Brain starts COLD (Risk high!)")
+            reasons.append(f"RSI Neutral({rsi:.0f})")
+
+        # Analisis Trend (Price vs EMA)
+        if price > ema:
+            reasons.append("Trend UP")
+        else:
+            reasons.append("Trend DOWN")
+
+        return " + ".join(reasons)
 
     async def run(self):
         await self.init()
@@ -207,10 +203,6 @@ class Brain:
         while True:
             if self.is_training_mode:
                 await asyncio.sleep(5)
-                continue
-
-            if not self.is_market_open():
-                await asyncio.sleep(300)
                 continue
 
             candles = await streamor.consume_market_data()
@@ -232,56 +224,80 @@ class Brain:
                 if await state_manager.get_active_position() or self.is_pending_order:
                     continue
 
-                # --- LOGIKA AI (REAL INFERENCE) ---
                 action = "HOLD"
+                prob_pct = 0.0
+                explanation = "Analyzing..."
+                order_type = "MARKET"  # Default untuk AI Brain V1 adalah Market Order
 
-                if (
-                    self.model and len(self.buffer) >= settings.SEQ_LEN + 20
-                ):  # Buffer lebih utk hitung indikator
+                if self.model and len(self.buffer) >= settings.SEQ_LEN + 20:
                     try:
-                        # 1. Konversi Buffer ke DataFrame
                         df = pd.DataFrame(list(self.buffer))
+                        df_features, scaled_data = processor.process(df)
 
-                        # 2. Proses Data (Hitung RSI, EMA, lalu Scaling)
-                        # Ini menggunakan logika yang sama persis dengan train.py
-                        _, scaled_data = processor.process(df)
-
-                        # 3. Cek panjang data setelah dipotong indikator (NaN drop)
                         if len(scaled_data) >= settings.SEQ_LEN:
-                            # Ambil SEQ_LEN terakhir
                             input_seq = scaled_data[-settings.SEQ_LEN :]
-
-                            # 4. Konversi ke Tensor [Batch, Seq, Feature]
                             tensor = torch.FloatTensor(input_seq).unsqueeze(0)
 
-                            # 5. Prediksi
                             with torch.no_grad():
                                 logits = self.model(tensor)
-                                # Mapping: 0=HOLD, 1=BUY, 2=SELL (Sesuai train.py)
-                                pred = torch.argmax(logits, dim=1).item()
+                                probs = F.softmax(logits, dim=1)
+                                top_p, top_class = torch.max(probs, dim=1)
+
+                                pred = top_class.item()
+                                prob_pct = top_p.item() * 100
 
                                 if pred == 1:
                                     action = "BUY"
                                 elif pred == 2:
                                     action = "SELL"
 
+                            # Generate Keterangan
+                            last_row = df_features.iloc[-1]
+                            rsi_val = last_row.get("RSI_14", 50)
+                            ema_val = last_row.get("EMA_20", 0)
+                            close_val = last_row.get("close", 0)
+
+                            explanation = self.generate_explanation(
+                                rsi_val, close_val, ema_val
+                            )
+
                     except Exception as e:
                         logger.error(f"Prediction Error: {e}")
 
-                # Kirim Sinyal jika ada
                 if action != "HOLD":
-                    logger.info(f"🚀 AI Signal Generated: {action}")
+                    # Tetapkan tipe order secara eksplisit untuk log dan payload
+                    order_type_display = "NOW (Market)"
+
+                    # --- FORMAT LOG LENGKAP ---
+                    log_msg = (
+                        f"\n📊 AI SIGNAL REPORT:\n"
+                        f"• Prices       : {c['close']}\n"
+                        f"• Action       : {action}\n"
+                        f"• Tipe         : {order_type_display}\n"  # <--- Tipe Order Ditampilkan
+                        f"• Prob         : {prob_pct:.2f}%\n"
+                        f"• Kepercayaan  : {prob_pct:.2f}%\n"
+                        f"• Ket          : {explanation}"
+                    )
+                    logger.info(log_msg)
+                    # --------------------------
+
                     self.is_pending_order = True
                     self.pending_start_time = datetime.datetime.now()
 
-                    await streamor.push_signal(
-                        {
-                            "action": action,
-                            "symbol": settings.ACTIVE_SYMBOLS[0],
-                            "entry_price": c["close"],
-                            "timestamp": str(datetime.datetime.now()),
-                        }
-                    )
+                    # KIRIM BALIK / PUSH SIGNAL SEGERA
+                    # Menambahkan field 'type' agar Fusion Engine/Executor tahu ini eksekusi langsung
+                    payload = {
+                        "action": action,
+                        "type": "MARKET",  # <--- Dikirim di payload
+                        "symbol": settings.ACTIVE_SYMBOLS[0],
+                        "entry_price": c["close"],
+                        "timestamp": str(datetime.datetime.now()),
+                        "confidence": prob_pct,
+                        "reason": explanation,
+                        "source": "BRAIN_V1",
+                    }
+                    await streamor.push_signal(payload)
+                    logger.info("🚀 Signal Pushed Downstream Immediately.")
 
 
 if __name__ == "__main__":

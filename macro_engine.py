@@ -21,7 +21,7 @@ class MacroEngine:
         )
         self.connected = False
 
-    def init_mt5(self):
+    def _init_mt5_sync(self):
         if not mt5.initialize(
             path=settings.MT5_PATH,
             login=settings.MT5_LOGIN,
@@ -33,75 +33,52 @@ class MacroEngine:
         self.connected = True
         return True
 
-    async def check_calendar(self):
+    def _check_market_sync(self):
+        """Fungsi sync untuk cek kondisi pasar (dijalankan di thread)"""
         if not self.connected:
-            if not self.init_mt5():
-                return
+            if not self._init_mt5_sync():
+                return "DANGER", "MT5 Disconnected"
 
-        # 1. Tentukan mata uang yang relevan (misal USD dan EUR untuk EURUSD)
-        # Ambil dari config settings.ACTIVE_SYMBOLS
-        # Simpelnya: Kita ambil berita USD dan EUR saja (Major Pair)
-        currencies = ["USD", "EUR", "GBP", "JPY"]
-
-        # 2. Ambil event calendar dari MT5 (Range: Hari ini)
-        now = datetime.datetime.now()
-        start = now
-        end = now + datetime.timedelta(hours=24)  # Cek 24 jam ke depan
+        status = "SAFE"
+        msg = "Normal"
 
         try:
-            # mt5.calendar_events memberi daftar event (metadata), bukan jadwal waktu
-            # Untuk jadwal waktu spesifik, kita butuh logika filter manual atau library external
-            # KARENA MT5 Python API Calendar agak kompleks, kita gunakan pendekatan Sederhana:
-            # Kita filter event penting secara manual jika API MT5 belum support full 'economic_calendar'
-            # ATAU: Gunakan library 'investpy' (tapi sering maintenance).
-
-            # --- SOLUSI STABIL: Menggunakan MT5 Native (jika versi support) ---
-            # Jika tidak, kita gunakan logika "Time Filter" sederhana
-            # (Menghindari jam volatile pembukaan sesi)
-
-            status = "SAFE"
-            upcoming_msg = "None"
-
-            # Cek Jam Pasar (Hard Filter)
-            # Hindari trading saat pergantian hari (Swap) atau market close
-            # Jam 23:55 - 00:05 Server Time
-            # MT5 Time
-            mt5_time = mt5.symbol_info_tick("EURUSD").time
-            mt5_dt = datetime.datetime.fromtimestamp(mt5_time)
-
-            # Contoh: Hindari News NFP (Jumat minggu pertama) - Logic Manual
-            # Ini lebih aman daripada scraping yang mudah error.
-
-            # Deteksi Volatilitas Tinggi via Spread
-            # Jika spread melebar 3x lipat -> Anggap ada News
-            tick = mt5.symbol_info_tick(settings.ACTIVE_SYMBOLS[0])
+            # 1. Cek Spread (Indikasi News/Volatilitas)
+            symbol = settings.ACTIVE_SYMBOLS[0]
+            tick = mt5.symbol_info_tick(symbol)
             if tick:
-                spread = tick.ask - tick.bid
-                point = mt5.symbol_info(settings.ACTIVE_SYMBOLS[0]).point
-                spread_points = spread / point
+                info = mt5.symbol_info(symbol)
+                if info:
+                    spread = tick.ask - tick.bid
+                    spread_points = spread / info.point
 
-                # Threshold Spread 50 poin (5 pips) -> DANGER
-                if spread_points > 50:
-                    status = "DANGER"
-                    upcoming_msg = f"High Spread ({spread_points:.1f} pts)"
-                    logger.warning(f"🚨 MARKET DANGER: {upcoming_msg}")
+                    if spread_points > 50:  # Spread > 50 poin (5 pips)
+                        status = "DANGER"
+                        msg = f"High Spread ({spread_points:.1f} pts)"
 
-            # Push Status
-            await self.r.set("macro:status", status)
-            await self.r.set("macro:next_event", upcoming_msg)
-
-            if status == "SAFE":
-                # Heartbeat log
-                pass  # logger.info("✅ Macro: Safe")
+            # 2. Cek Jam (Opsional: Hindari jam swap 23:55-00:05)
+            # ... tambahkan logic jam server di sini jika perlu ...
 
         except Exception as e:
-            logger.error(f"Calendar Check Error: {e}")
+            logger.error(f"Macro Check Error: {e}")
+            return "DANGER", "Check Error"
+
+        return status, msg
 
     async def run(self):
-        logger.info("📅 Macro Engine Started (Spread & Time Guard)")
+        logger.info("📅 Macro Engine Started (Non-Blocking)")
         while True:
-            await self.check_calendar()
-            await asyncio.sleep(10)  # Cek tiap 10 detik
+            # Gunakan to_thread agar loop utama tidak macet saat MT5 lag
+            status, msg = await asyncio.to_thread(self._check_market_sync)
+
+            # Update Redis
+            await self.r.set("macro:status", status)
+            await self.r.set("macro:next_event", msg)
+
+            if status == "DANGER":
+                logger.warning(f"🚨 MARKET DANGER: {msg}")
+
+            await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
