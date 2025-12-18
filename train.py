@@ -143,32 +143,38 @@ async def train():
         model.eval()
         correct = 0
         total = 0
-        with torch.no_grad():
-            for vx, vy in val_loader:
-                out = model(vx)
-                pred = torch.argmax(out, dim=1)
-                correct += (pred == vy).sum().item()
-                total += vy.size(0)
 
-        val_acc = correct / total
-        logger.info(
-            f"Ep {epoch+1} | Loss: {total_loss/len(train_loader):.4f} | Val Acc: {val_acc*100:.2f}%"
-        )
-        # --- TAMBAHAN DEBUGGING ---
-        # Kumpulkan semua prediksi validasi
         all_preds = []
         all_targets = []
         with torch.no_grad():
             for vx, vy in val_loader:
                 out = model(vx)
-                preds = torch.argmax(out, dim=1)
-                all_preds.extend(preds.numpy())
-            all_targets.extend(vy.numpy())
+                pred = torch.argmax(out, dim=1)
 
-        cm = confusion_matrix(all_targets, all_preds)
-        logger.info(f"Confusion Matrix:\n{cm}")
+                # Hitung akurasi biasa
+                correct += (pred == vy).sum().item()
+                total += vy.size(0)
 
+                # 2. Masukkan data ke list DI DALAM LOOP
+                # PENTING: Pastikan baris ini sejajar (lurus) dengan 'out = model(vx)'
+                all_preds.extend(pred.cpu().numpy())
+                all_targets.extend(vy.cpu().numpy())
+
+        val_acc = correct / total
+        logger.info(
+            f"Ep {epoch+1} | Loss: {total_loss/len(train_loader):.4f} | Val Acc: {val_acc*100:.2f}%"
+        )
+        try:
+            from sklearn.metrics import confusion_matrix
+
+            # Sekarang jumlah data pasti sama karena di-extend barengan di dalam loop
+            cm = confusion_matrix(all_targets, all_preds)
+            logger.info(f"Confusion Matrix:\n{cm}")
+        except Exception as e:
+            logger.error(f"Confusion Matrix Error: {e}")
         # --- TAMBAHAN DEBUGGING ---
+        logger.info(f"All Targets: {all_targets}")
+        logger.info(f"All Predictions: {all_preds}")
 
         # Early Stopping
         if val_acc > best_acc:
@@ -201,4 +207,5 @@ async def train():
 
 
 if __name__ == "__main__":
+    asyncio.run(train())
     asyncio.run(train())
