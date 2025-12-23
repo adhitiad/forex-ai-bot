@@ -1,113 +1,127 @@
 import asyncio
+import json
 import logging
+import os
 from collections import deque
 
-import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd
+import redis.asyncio as redis
 from stable_baselines3 import PPO
 
 from config import settings
 from features import processor
-from logging_config import setup_logger
+from state_manager import state_manager
 from stream_manager import streamor
 
-logger = setup_logger("Brain-RL")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("Brain-RL-Multi")
 
 
 class BrainRL:
     def __init__(self):
-        self.buffers = {sym: deque(maxlen=100) for sym in settings.ACTIVE_SYMBOLS}
-        self.model = None
-        self.model_path = "data/rl_model_ppo"  # Pastikan file ini ada hasil training
+        # Dictionary untuk menyimpan model per symbol
+        # Contoh: {'EURUSD': <PPO Object>, 'XAUUSD': <PPO Object>}
+        self.models = {}
+        self.buffers = {}
 
-    def load_model(self):
-        try:
-            # Menggunakan device cpu agar tidak berebut GPU dengan Brain V1
-            self.model = PPO.load(self.model_path, device="cpu")
-            logger.info("🧠 RL Agent Loaded (PPO).")
-        except:
-            logger.warning(
-                f"⚠️ RL Model not found at {self.model_path}. RL will stay silent."
-            )
-
-    def warmup_data(self):
-        """Warmup penting untuk indikator"""
-        if not mt5.initialize():
-            return
-        logger.info("🔥 Warming up RL buffers...")
+        # Init buffer per symbol
         for sym in settings.ACTIVE_SYMBOLS:
-            rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, 100)
-            if rates is not None:
-                for r in rates:
-                    data = {
-                        "symbol": sym,
-                        "close": float(r["close"]),
-                        "open": float(r["open"]),
-                        "high": float(r["high"]),
-                        "low": float(r["low"]),
-                        "volume": float(r["tick_volume"]),
-                        "timestamp": str(r["time"]),
-                    }
-                    self.buffers[sym].append(data)
+            self.buffers[sym] = deque(
+                maxlen=200
+            )  # RL butuh data terakhir untuk feature extraction
+
+        self.r = redis.Redis(
+            host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True
+        )
+
+    async def load_all_agents(self):
+        """Load semua model RL yang tersedia untuk active symbols"""
+        for sym in settings.ACTIVE_SYMBOLS:
+            # Nama file harus match dengan yang di train_rl.py
+            model_path = os.path.join(settings.BASE_DIR, "data", f"rl_model_{sym}.zip")
+
+            if os.path.exists(model_path):
+                try:
+                    # Load model
+                    self.models[sym] = PPO.load(model_path)
+                    logger.info(f"🤖 Agent RL Loaded: {sym}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to load RL agent {sym}: {e}")
+            else:
+                logger.warning(f"⚠️ RL Model not found for {sym}. Skipping.")
 
     async def run(self):
-        self.load_model()
-        self.warmup_data()
+        await self.load_all_agents()
         await streamor.connect()
+        logger.info(f"🧠 Brain RL Running for: {settings.ACTIVE_SYMBOLS}")
 
-        logger.info("🚀 Brain RL (Expert) Running...")
         while True:
-            # Gunakan consumer group agar tidak berebut pesan dengan Brain V1
-            candles = await streamor.consume_market_data(
-                group="rl_group", consumer="rl_node_1"
-            )
-
+            # Terima data market
+            candles = await streamor.consume_market_data()
             if not candles:
                 await asyncio.sleep(0.01)
                 continue
 
             for c in candles:
-                sym = c.get("symbol")
-                if sym not in self.buffers:
+                symbol = c["symbol"]
+
+                # Skip jika symbol tidak aktif atau agent-nya belum ada
+                if symbol not in settings.ACTIVE_SYMBOLS or symbol not in self.models:
                     continue
-                self.buffers[sym].append(c)
 
-                # Syarat Minimal Data
-                if len(self.buffers[sym]) >= 60 and self.model:
-                    try:
-                        df = pd.DataFrame(list(self.buffers[sym]))
-                        # Gunakan processor fitur yang sama agar data konsisten
-                        _, features = processor.process(df)
+                # Masukkan buffer
+                self.buffers[symbol].append(c)
 
-                        if len(features) < 1:
-                            continue
+                # Cek Posisi Aktif (Jangan trade jika sudah ada posisi)
+                if await state_manager.get_active_position(symbol):
+                    continue
 
-                        # === INFERENCE ===
-                        # Obs terakhir untuk prediksi langkah selanjutnya
-                        obs = features[-1:]
-                        action, _ = self.model.predict(obs, deterministic=True)
+                # Butuh minimal data untuk scaling
+                if len(self.buffers[symbol]) < 20:
+                    continue
 
-                        # Mapping Action Space: 0=Hold, 1=Buy, 2=Sell (Contoh Discrete)
-                        act_str = "HOLD"
-                        if action == 1:
-                            act_str = "BUY"
-                        elif action == 2:
-                            act_str = "SELL"
+                try:
+                    # 1. Prepare Data (Single Row Inference)
+                    # Kita ambil snapshot terakhir, tapi processor butuh df untuk scaling
+                    df = pd.DataFrame(list(self.buffers[symbol]))
 
-                        if act_str != "HOLD":
-                            # Kirim sinyal ke Fusion Engine
-                            payload = {
+                    # Process: scaling menggunakan scaler spesifik symbol
+                    _, scaled_data = processor.process(df, symbol=symbol)
+
+                    if len(scaled_data) == 0:
+                        continue
+
+                    # Ambil data point terakhir sebagai observasi
+                    obs = scaled_data[-1]
+
+                    # 2. Predict Action using Specific Agent
+                    agent = self.models[symbol]
+                    action, _states = agent.predict(obs, deterministic=True)
+
+                    # Map Action (0: HOLD, 1: BUY, 2: SELL)
+                    final_act = "HOLD"
+                    if action == 1:
+                        final_act = "BUY"
+                    elif action == 2:
+                        final_act = "SELL"
+
+                    if final_act != "HOLD":
+                        logger.info(f"💡 RL Signal {symbol}: {final_act}")
+                        # Push Signal dengan Source BRAIN_RL
+                        await streamor.push_signal(
+                            {
+                                "action": final_act,
+                                "symbol": symbol,
+                                "confidence": 65.0,  # RL biasanya tidak output probability langsung di stable-baselines
+                                "reason": "RL Agent Decision",
                                 "source": "BRAIN_RL",
-                                "symbol": sym,
-                                "action": act_str,
-                                "price": c["close"],
-                                "confidence": 0.8,  # RL Model biasanya confident
+                                "type": "MARKET",
                             }
-                            await streamor.push_signal(payload)
+                        )
 
-                    except Exception as e:
-                        logger.error(f"RL Inference Error: {e}")
+                except Exception as e:
+                    logger.error(f"RL Prediction Error {symbol}: {e}")
 
 
 if __name__ == "__main__":

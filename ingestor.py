@@ -1,85 +1,69 @@
-# File: ingestor.py
 import asyncio
-import datetime
 import logging
-
-import grpc
-import MetaTrader5 as mt5
-
+import yfinance as yf
+import pandas as pd
 from config import settings
-from logging_config import setup_logger
 
-# Jika masih mau simpan ke DB via gRPC, uncomment bagian gRPC
-from protos import market_pb2, market_pb2_grpc
-from stream_manager import streamor
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("YF-Ingestor")
 
-logger = setup_logger("MT5-Ingestor")
+class DataFetcher:
+    async def fetch_market_data(self, symbol, days=730):
+        """Ambil history dari Yahoo Finance"""
+        logger.info(f"📥 Downloading {symbol} ({days} days)...")
+        try:
+            # Gunakan interval 1h untuk history panjang (2 tahun)
+            # karena yfinance 15m dibatasi hanya 60 hari terakhir.
+            # Untuk training pola jangka panjang, 1h sangat bagus.
+            df = await asyncio.to_thread(
+                yf.download,
+                tickers=symbol,
+                period=f"{days}d",
+                interval="1h",
+                progress=False,
+                auto_adjust=True
+            )
 
+            if df.empty: return pd.DataFrame()
 
-class Ingestor:
+            # Bersihkan format kolom
+            df.reset_index(inplace=True)
+            df.columns = [c.lower() for c in df.columns]
+            
+            # Standardisasi nama kolom waktu
+            if 'date' in df.columns: df.rename(columns={'date': 'time'}, inplace=True)
+            if 'datetime' in df.columns: df.rename(columns={'datetime': 'time'}, inplace=True)
+            
+            # Hapus volume 0 (Market Libur)
+            if 'volume' in df.columns:
+                df = df[df['volume'] > 0]
+
+            # Reset Index (Stitching)
+            df.reset_index(drop=True, inplace=True)
+            
+            logger.info(f"✅ Loaded {len(df)} candles for {symbol}")
+            return df
+
+        except Exception as e:
+            logger.error(f"Error fetching {symbol}: {e}")
+            return pd.DataFrame()
+
+class DataIngestor:
     def __init__(self):
-        self.active_symbols = settings.ACTIVE_SYMBOLS
-        self.channel = grpc.aio.insecure_channel("data_service:50051")
-        self.stub = market_pb2_grpc.MarketDataServiceStub(self.channel)
+        self.fetcher = DataFetcher()
 
-    def init_mt5(self):
-        if not mt5.initialize(
-            path=settings.MT5_PATH,
-            login=settings.MT5_LOGIN,
-            password=settings.MT5_PASSWORD,
-            server=settings.MT5_SERVER,
-        ):
-            logger.error("MT5 Init Failed")
-            return False
-        return True
-
-    async def fetch_and_push(self):
-        if not self.active_symbols:
+    async def ingest(self, symbol):
+        df = await self.fetcher.fetch_market_data(symbol)
+        if df.empty:
+            logger.warning(f"No data found for {symbol}")
             return
 
-        for symbol in self.active_symbols:
-            # Ambil Candle Terakhir (M1)
-            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 1)
+        # Proses data lebih lanjut...
+        # ...
+        
+        # Simpan data ke Redis
+        await self.save_to_redis(df, symbol)
 
-            if rates is None or len(rates) == 0:
-                continue
-
-            tick = rates[0]
-            # Convert numpy types to python native types
-            price = float(tick["close"])
-            vol = float(tick["tick_volume"])
-            ts = str(datetime.datetime.now())
-
-            # Payload untuk Redis Stream (Brain)
-            stream_payload = {
-                "symbol": symbol,
-                "close": price,
-                "open": float(tick["open"]),
-                "high": float(tick["high"]),
-                "low": float(tick["low"]),
-                "volume": vol,
-                "timestamp": ts,
-            }
-
-            # Push ke Redis
-            await streamor.push_market_data(symbol, stream_payload)
-
-            # Log periodic (agar terminal tidak penuh)
-            # logger.info(f"Tick: {symbol} @ {price}")
-
-    async def run(self):
-        await streamor.connect()
-        if not self.init_mt5():
-            return
-
-        logger.info(f"📡 MT5 Ingestor Started. Watching: {self.active_symbols}")
-
-        while True:
-            await self.fetch_and_push()
-            # Ambil data setiap 1 detik (Real-time)
-            # Jauh lebih cepat dari yfinance (60s)
-            await asyncio.sleep(1)
-
-
-if __name__ == "__main__":
-    asyncio.run(Ingestor().run())
+    async def save_to_redis(self, df, symbol):
+        # Simpan DataFrame ke Redis
+        pass

@@ -1,67 +1,103 @@
+"""
+Telegram Stream Manager
+"""
+
 import asyncio
 import json
 import logging
+from datetime import datetime
 
+import pandas as pd
 import redis.asyncio as redis
+import yfinance as yf
 
 from config import settings
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("StreamManager")
+logger = logging.getLogger("Stream-YFinance")
 
 
-class StreamManager:
+class MarketStreamer:
     def __init__(self):
-        self.r = None
+        self.r = redis.Redis(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            db=settings.REDIS_DB,
+            decode_responses=True,
+        )
 
     async def connect(self):
-        try:
-            kwargs = {
-                "host": settings.REDIS_HOST,
-                "port": settings.REDIS_PORT,
-                "decode_responses": True,
-            }
-            if settings.REDIS_PASSWORD:
-                kwargs["password"] = settings.REDIS_PASSWORD
-            self.r = redis.Redis(**kwargs)
-            # Test connection
-            await self.r.ping()
-            logger.info("✅ Redis Connected")
-        except Exception as e:
-            logger.error(f"❌ Redis Error: {e}")
+        logger.info("✅ YFinance Streamer Active (Batch Polling Mode)")
 
-    async def push_market_data(self, symbol, data):
-        if self.r:
-            await self.r.xadd(settings.CHANNEL_MARKET, {"data": json.dumps(data)})
-            await self.r.publish(settings.CHANNEL_MARKET, json.dumps(data))
+    async def consume_market_data(self):
+        """
+        Mengambil data live.
+        Teknik: Batch Download (Semua simbol sekali request) biar cepat.
+        """
+        candles = []
+        tickers_str = " ".join(settings.ACTIVE_SYMBOLS)
 
-    async def consume_market_data(self, group="brain_group", consumer="brain_1"):
-        if not self.r:
-            return []
         try:
-            await self.r.xgroup_create(
-                settings.CHANNEL_MARKET, group, id="0", mkstream=True
+            # Download data hari ini (1d), interval sesuai config (15m)
+            # group_by='ticker' agar format rapi per simbol
+            data = await asyncio.to_thread(
+                yf.download,
+                tickers=tickers_str,
+                period="1d",
+                interval=settings.TIMEFRAME,
+                group_by="ticker",
+                progress=False,
+                auto_adjust=True,
+                threads=True,
             )
-        except:
-            pass
 
-        messages = await self.r.xreadgroup(
-            group, consumer, {settings.CHANNEL_MARKET: ">"}, count=10
-        )
-        parsed = []
-        ids = []
-        for stream, entries in messages:
-            for msg_id, content in entries:
-                if "data" in content:
-                    parsed.append(json.loads(content["data"]))
-                    ids.append(msg_id)
-        if ids:
-            await self.r.xack(settings.CHANNEL_MARKET, group, *ids)
-        return parsed
+            if data.empty:
+                return []
 
-    async def push_signal(self, signal):
-        if self.r:
-            await self.r.publish(settings.CHANNEL_SIGNALS, json.dumps(signal))
+            # Loop per simbol untuk ambil baris terakhir
+            for symbol in settings.ACTIVE_SYMBOLS:
+                try:
+                    # Handle jika cuma 1 simbol, format dataframe beda
+                    if len(settings.ACTIVE_SYMBOLS) == 1:
+                        df_sym = data
+                    else:
+                        df_sym = data[symbol]
+
+                    # Bersihkan NaN
+                    df_sym = df_sym.dropna()
+
+                    if not df_sym.empty:
+                        last_row = df_sym.iloc[-1]
+
+                        # Masukkan ke format standar Bot
+                        candles.append(
+                            {
+                                "symbol": symbol,
+                                "open": float(last_row["Open"]),
+                                "high": float(last_row["High"]),
+                                "low": float(last_row["Low"]),
+                                "close": float(last_row["Close"]),
+                                "volume": float(last_row["Volume"]),
+                                "timestamp": str(last_row.name),  # Jam Candle
+                                "source": "YFINANCE",
+                            }
+                        )
+                except KeyError:
+                    continue  # Simbol mungkin gagal download, skip aja
+
+            # Jeda Polling
+            # Jika Timeframe 15m, tidak perlu cek tiap detik.
+            # Cek tiap 1 menit sudah cukup cepat.
+            await asyncio.sleep(60)
+
+        except Exception as e:
+            logger.error(f"Stream Error: {e}")
+            await asyncio.sleep(10)  # Jeda kalau error
+
+        return candles
+
+    async def push_signal(self, payload):
+        await self.r.publish(settings.CHANNEL_AI_ANALYSIS, json.dumps(payload))
 
 
-streamor = StreamManager()
+streamor = MarketStreamer()
